@@ -66,23 +66,17 @@ pub trait ErasedHandle: Send + Sync {
     fn dispatch(&self, buf: &[u8]) -> Result<(), MqttError>;
 }
 
-pub struct TypedHandle<T: 'static> {
+pub struct SubscriptionHandle<T: 'static> {
     signal: &'static Signal<CriticalSectionRawMutex, T>,
 }
 
-impl<T: 'static> TypedHandle<T> {
+impl<T: 'static> SubscriptionHandle<T> {
     pub fn new(signal: &'static Signal<CriticalSectionRawMutex, T>) -> Self {
         Self { signal }
     }
 }
 
-/* SAFETY: DynamicSender only exposes try_send, which goes through
-the channel's internal critical-section mutex - it's fine to
-call from multiple threads concurrently as long as T: Send. */
-unsafe impl<T: Send + 'static> Sync for TypedHandle<T> {}
-unsafe impl<T: Send + 'static> Send for TypedHandle<T> {}
-
-impl<T> ErasedHandle for TypedHandle<T>
+impl<T> ErasedHandle for SubscriptionHandle<T>
 where
     T: DeserializeOwned + Send + Sync + 'static,
 {
