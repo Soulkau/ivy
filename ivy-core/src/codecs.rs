@@ -9,10 +9,16 @@ pub trait Encode<C> {
 pub trait Decode<'a, C>: Sized {
     fn decode(buf: &'a [u8]) -> Result<Self, CodecError>;
 }
+/// Just a marker trait for codecs.
+pub trait Codec: 'static {}
 
 pub struct Json;
 
 pub struct Postcard;
+
+impl Codec for Json {}
+
+impl Codec for Postcard {}
 
 // Json
 impl<T> Encode<Json> for T
