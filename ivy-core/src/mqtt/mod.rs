@@ -1,4 +1,4 @@
-use core::{marker::PhantomData, net::Ipv4Addr};
+use core::{net::Ipv4Addr};
 
 use alloc::boxed::Box;
 use core::alloc::Allocator;
@@ -11,7 +11,7 @@ use embassy_net::{
     Stack,
     tcp::client::{TcpClient, TcpClientState},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
 use embedded_tls::{Aes128GcmSha256, CryptoRngCore, TlsConfig, UnsecureProvider};
 use heapless::String;
@@ -21,19 +21,19 @@ use mqttrust::{
     Config, IpBroker, MqttClient, MqttStack, Publish, State, Subscribe, SubscribeTopic,
     transport::embedded_tls::{TlsNalTransport, TlsState},
 };
-use serde::{Serialize, de::DeserializeOwned};
 
 pub use mqttrust::State as MqttState;
 use static_cell::StaticCell;
 
 use crate::{
-    codecs::Json,
+    codecs::{Codec, CodecError, Encode},
     logger::{LOG_SIZE, LogConsumer, LogSink, TAG_SIZE},
     mqtt::subscription::ErasedSubscription,
 };
 
 pub mod subscription;
 
+// Aliases for a TCP client state with 1 connection slot for mqtt.
 pub type MqttTcpClientState<const TCP: usize> = TcpClientState<1, TCP, TCP>;
 pub type MqttTcpClient<const TCP: usize> = TcpClient<'static, 1, TCP, TCP>;
 pub type MqttTlsState<const TLS: usize> = TlsState<TLS, TLS>;
@@ -43,9 +43,7 @@ type MqttProvider<Rng> = UnsecureProvider<'static, Aes128GcmSha256, Rng>;
 #[derive(Debug, thiserror::Error)]
 pub enum MqttError {
     #[error("decode error: {0}")]
-    Decode(#[from] serde_json_core::de::Error),
-    #[error("encode error: {0}")]
-    Encode(#[from] serde_json_core::ser::Error),
+    Codec(#[from] CodecError),
     #[error("mqtt client error: {0:?}")]
     MqttClient(mqttrust::Error),
     #[error("Disconnected")]
@@ -82,12 +80,12 @@ impl<const B: usize> SizedMqttHandle<B> {
         self.raw.clone()
     }
 
-    pub async fn publish<S: Serialize>(&self, topic: &'static str, data: S) -> Result<(), MqttError> {
+    pub async fn publish<C: Codec, T: Encode<C>>(&self, topic: &'static str, data: T) -> Result<(), MqttError> {
         let mut buffer = [0u8; B];
-        let payload = match serde_json_core::to_slice(&data, &mut buffer) {
+        let payload = match data.encode(&mut buffer) {
             Ok(payload) => payload,
             Err(e) => {
-                return Err(MqttError::Encode(e));
+                return Err(MqttError::Codec(e));
             }
         };
         /*  SAFETY: `buffer` outlives the request - it's not touched again until this
