@@ -1,4 +1,4 @@
-use core::net::Ipv4Addr;
+use core::{net::Ipv4Addr};
 
 use alloc::boxed::Box;
 use core::alloc::Allocator;
@@ -11,7 +11,7 @@ use embassy_net::{
     Stack,
     tcp::client::{TcpClient, TcpClientState},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
 use embedded_tls::{Aes128GcmSha256, CryptoRngCore, TlsConfig, UnsecureProvider};
 use heapless::String;
@@ -21,13 +21,19 @@ use mqttrust::{
     Config, IpBroker, MqttClient, MqttStack, Publish, State, Subscribe, SubscribeTopic,
     transport::embedded_tls::{TlsNalTransport, TlsState},
 };
-use serde::{Serialize, de::DeserializeOwned};
 
 pub use mqttrust::State as MqttState;
 use static_cell::StaticCell;
 
-use crate::logger::{LOG_SIZE, LogConsumer, LogSink, TAG_SIZE};
+use crate::{
+    codecs::{Codec, CodecError, Encode},
+    logger::{LOG_SIZE, LogConsumer, LogSink, TAG_SIZE},
+    mqtt::subscription::ErasedSubscription,
+};
 
+pub mod subscription;
+
+// Aliases for a TCP client state with 1 connection slot for mqtt.
 pub type MqttTcpClientState<const TCP: usize> = TcpClientState<1, TCP, TCP>;
 pub type MqttTcpClient<const TCP: usize> = TcpClient<'static, 1, TCP, TCP>;
 pub type MqttTlsState<const TLS: usize> = TlsState<TLS, TLS>;
@@ -37,60 +43,11 @@ type MqttProvider<Rng> = UnsecureProvider<'static, Aes128GcmSha256, Rng>;
 #[derive(Debug, thiserror::Error)]
 pub enum MqttError {
     #[error("decode error: {0}")]
-    Decode(#[from] serde_json_core::de::Error),
-    #[error("encode error: {0}")]
-    Encode(#[from] serde_json_core::ser::Error),
+    Codec(#[from] CodecError),
     #[error("mqtt client error: {0:?}")]
     MqttClient(mqttrust::Error),
     #[error("Disconnected")]
     Disconnected,
-}
-
-pub struct Subscription<T: 'static> {
-    receiver: &'static Signal<CriticalSectionRawMutex, T>,
-}
-
-impl<T: 'static> Subscription<T> {
-    pub fn new(receiver: &'static Signal<CriticalSectionRawMutex, T>) -> Self {
-        Self { receiver }
-    }
-}
-
-impl<T: 'static> Subscription<T> {
-    pub async fn next(&self) -> T {
-        self.receiver.wait().await
-    }
-}
-
-pub trait ErasedHandle: Send + Sync {
-    fn dispatch(&self, buf: &[u8]) -> Result<(), MqttError>;
-}
-
-pub struct TypedHandle<T: 'static> {
-    signal: &'static Signal<CriticalSectionRawMutex, T>,
-}
-
-impl<T: 'static> TypedHandle<T> {
-    pub fn new(signal: &'static Signal<CriticalSectionRawMutex, T>) -> Self {
-        Self { signal }
-    }
-}
-
-/* SAFETY: DynamicSender only exposes try_send, which goes through
-the channel's internal critical-section mutex - it's fine to
-call from multiple threads concurrently as long as T: Send. */
-unsafe impl<T: Send + 'static> Sync for TypedHandle<T> {}
-unsafe impl<T: Send + 'static> Send for TypedHandle<T> {}
-
-impl<T> ErasedHandle for TypedHandle<T>
-where
-    T: DeserializeOwned + Send + Sync + 'static,
-{
-    fn dispatch(&self, buf: &[u8]) -> Result<(), MqttError> {
-        let (value, _) = serde_json_core::from_slice(buf).map_err(MqttError::Decode)?;
-        self.signal.signal(value);
-        Ok(())
-    }
 }
 
 #[actor_handle(RawMqttHandle)]
@@ -123,12 +80,12 @@ impl<const B: usize> SizedMqttHandle<B> {
         self.raw.clone()
     }
 
-    pub async fn publish<S: Serialize>(&self, topic: &'static str, data: S) -> Result<(), MqttError> {
+    pub async fn publish<C: Codec, T: Encode<C>>(&self, topic: &'static str, data: T) -> Result<(), MqttError> {
         let mut buffer = [0u8; B];
-        let payload = match serde_json_core::to_slice(&data, &mut buffer) {
+        let payload = match data.encode(&mut buffer) {
             Ok(payload) => payload,
             Err(e) => {
-                return Err(MqttError::Encode(e));
+                return Err(MqttError::Codec(e));
             }
         };
         /*  SAFETY: `buffer` outlives the request - it's not touched again until this
@@ -171,7 +128,7 @@ impl<Rng: CryptoRngCore + 'static, const NET: usize, const TCP: usize, const TLS
 }
 
 pub struct MqttModule<Rng: CryptoRngCore + 'static, const S: usize, const NET: usize = 4096, const TCP: usize = 4096, const TLS: usize = 16640> {
-    subscribers: [(&'static str, &'static dyn ErasedHandle); S],
+    subscribers: [&'static dyn ErasedSubscription; S],
     network_stack: Stack<'static>,
     mqtt_stack: MqttStack<'static, CriticalSectionRawMutex>,
     client: MqttClient<'static, CriticalSectionRawMutex>,
@@ -184,19 +141,15 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
         tracing::debug!(tag = "mqtt", "started acting");
         let mqtt_stack_task = Self::run_stack_task(&mut self.mqtt_stack, &mut self.transport, self.network_stack.clone());
         tracing::debug!(tag = "mqtt", "mqtt task was created");
-        let topics: [SubscribeTopic<'static>; S] = core::array::from_fn(|i| {
-            let (name, _handle) = self.subscribers[i];
-            name.into()
-        });
 
-        let client_task = Self::run_client_task(&self.subscribers, &self.client, &topics, &mut inbox);
+        let client_task = Self::run_client_task(&self.subscribers, &self.client, &mut inbox);
         tracing::debug!(tag = "mqtt", "client task was created");
         join(client_task, mqtt_stack_task).await.1
     }
 }
 
 impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, const TLS: usize> MqttModule<Rng, S, NET, TCP, TLS> {
-    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, creds: MqttCredentials, subscribers: [(&'static str, &'static dyn ErasedHandle); S]) -> Self {
+    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, creds: MqttCredentials, subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
         tracing::info!(tag = "mqtt", "creating mqtt module");
         static CREDS: StaticCell<MqttCredentials> = StaticCell::new();
         let creds = CREDS.init(creds);
@@ -247,9 +200,8 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
     /// Runs the main mqtt client task loop: waits for connection, races background workers
     /// against disconnect detection, then drains the inbox until reconnected.
     async fn run_client_task(
-        subscribers: &[(&'static str, &'static dyn ErasedHandle); S],
+        subscribers: &[&'static dyn ErasedSubscription; S],
         client: &MqttClient<'static, CriticalSectionRawMutex>,
-        topics: &[SubscribeTopic<'static>; S],
         inbox: &mut ivy_types::actor::Inbox<<RawMqttHandle as ivy_types::actor::ActorHandle>::Cmd>,
     ) -> ! {
         loop {
@@ -258,7 +210,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
             tracing::debug!(tag = "mqtt", "connected, starting worker tasks");
             // Neither of those tasks, should ever return. Only point of failure is mqtt_client itself, if connection lost all of tasks would be cancelled anyways.
             let inbox_task = Self::handle_inbox_task(client, inbox);
-            let sub_task = Self::handle_subscriptions(subscribers, client, topics);
+            let sub_task = Self::handle_subscriptions(subscribers, client);
             let disconnect_watch = Self::wait_for_disconnect(client);
 
             // Neither of those futures, besides disconnect_watch ever returns.
@@ -306,11 +258,16 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
             }
         }
     }
+
     /// Manages subscriptions
-    async fn handle_subscriptions(subscribers: &[(&'static str, &'static dyn ErasedHandle); S], client: &MqttClient<'static, CriticalSectionRawMutex>, topics: &[SubscribeTopic<'static>; S]) -> ! {
+    async fn handle_subscriptions(subscribers: &[&'static dyn ErasedSubscription; S], client: &MqttClient<'static, CriticalSectionRawMutex>) -> ! {
+        let topics: &[SubscribeTopic<'static>] = &subscribers.map(|sub| sub.topic().into());
+
         loop {
             tracing::debug!(tag = "mqtt", "subscribing to topics");
+
             let mut back_off_ms = 2000;
+
             let mut subscription = loop {
                 let sub_pkt = Subscribe::builder().topics(topics).build();
 
@@ -321,72 +278,37 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
                     }
                     Err(e) => {
                         tracing::error!(tag = "mqtt", "subscribe failed: {:?}. retrying in {}ms...", e, back_off_ms);
+
                         Timer::after(Duration::from_millis(back_off_ms)).await;
                         back_off_ms = (back_off_ms * 3 / 2).min(20000);
                     }
                 }
             };
+
             loop {
                 match subscription.next_message().await {
                     Some(msg) => {
-                        let handle = subscribers.iter().find(|(name, _)| *name == msg.topic_name());
-                        let Some(handle) = handle else {
+                        let Some(subscriber) = subscribers.iter().find(|sub| sub.topic() == msg.topic_name()) else {
                             tracing::warn!(tag = "mqtt", "no handle found for topic {}", msg.topic_name());
                             continue;
                         };
-                        let Err(e) = handle.1.dispatch(&msg.payload()) else {
-                            tracing::debug!(tag = "mqtt", "dispatched message for topic {}", msg.topic_name());
-                            continue;
-                        };
-                        tracing::error!(tag = "mqtt", "failed to dispatch error: {}", e);
+
+                        match subscriber.dispatch(msg.payload()) {
+                            Ok(()) => {
+                                tracing::debug!(tag = "mqtt", "dispatched message for topic {}", msg.topic_name());
+                            }
+                            Err(e) => {
+                                tracing::error!(tag = "mqtt", "failed to dispatch message for topic {}: {}", msg.topic_name(), e);
+                            }
+                        }
                     }
-                    None => tracing::error!(tag = "mqtt", "received none"),
+                    None => {
+                        tracing::error!(tag = "mqtt", "received none");
+                    }
                 }
             }
         }
     }
-}
-/// Macro to pre-declares subscriptions, that will be managed by mqtt durning app lifetime.
-#[macro_export]
-macro_rules! declare_subcriptions {
-    ( $( $name:ident => $topic:literal : $payload:ty ),+ $(,)? ) => {
-        {
-            $crate::paste::paste! {
-                $(
-                    static [<$name:upper _SIGNAL>]: ::embassy_sync::signal::Signal<
-                        ::embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-                        $payload,
-                    > = ::embassy_sync::signal::Signal::new();
-                )+
-                pub struct SubscriberReg {
-                    $( pub $name: $crate::mqtt::TypedHandle<$payload>, )+
-                }
-                impl SubscriberReg {
-                    fn new() -> Self {
-                        Self {
-                            $( $name: $crate::mqtt::TypedHandle::new(&[<$name:upper _SIGNAL>]), )+
-                        }
-                    }
-                }
-            }
-            // everything below is OUTSIDE paste!, so $crate:: stays intact
-            static SUBSCRIBER_REG: ::static_cell::StaticCell<SubscriberReg> =
-                ::static_cell::StaticCell::new();
-            let reg: &'static SubscriberReg = SUBSCRIBER_REG.init(SubscriberReg::new());
-            let handles: [(&'static str, &'static dyn $crate::mqtt::ErasedHandle); $crate::count!($($name)+)] = [
-                $( ($topic, &reg.$name as &'static dyn $crate::mqtt::ErasedHandle), )+
-            ];
-            let subs = $crate::paste::paste! {
-                ( $( $crate::mqtt::Subscription::new(&[<$name:upper _SIGNAL>]), )+ )
-            };
-            (handles, subs)
-        }
-    };
-}
-#[macro_export]
-macro_rules! count {
-    () => { 0 };
-    ($_head:ident $($tail:ident)*) => { 1 + count!($($tail)*) };
 }
 
 const DEFAULT_LOG_OVERHEAD: usize = 100;
