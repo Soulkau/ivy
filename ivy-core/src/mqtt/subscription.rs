@@ -2,7 +2,6 @@ use core::marker::PhantomData;
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 
-use crate::{codecs::Json, mqtt::MqttError};
 use crate::codecs::{Codec, CodecError, Decode};
 
 ///Trait alias for types that can be decoded inside of MqttSubscription
@@ -37,19 +36,19 @@ where
 
 pub trait ErasedSubscription: Sync {
     fn topic(&self) -> &'static str;
-    fn dispatch(&self, buf: &[u8]) -> Result<(), MqttError>;
+    fn dispatch(&self, buf: &[u8]) -> Result<(), CodecError>;
 }
 
 impl<T, C> ErasedSubscription for Subscription<T, C>
 where
-    T: DeserializeOwned + Send + Sync + 'static,
+    T: Decodable<C>,
+    C: Codec,
 {
     fn topic(&self) -> &'static str {
         self.topic
     }
 
-    fn dispatch(&self, buf: &[u8]) -> Result<(), MqttError> {
-        let (value, _) = serde_json_core::from_slice(buf).map_err(MqttError::Decode)?;
+    fn dispatch(&self, buf: &[u8]) -> Result<(), CodecError> {
         let value = <T as Decode<C>>::decode(buf)?;
         self.signal.signal(value);
         Ok(())
