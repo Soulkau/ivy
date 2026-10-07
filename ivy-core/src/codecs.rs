@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-pub struct CodecError {}
+// TODO: Finish error type
+#[derive(Debug, thiserror::Error)]
+pub enum CodecError {
+    #[error("codec error")]
+    Unknown,
+}
 
 pub trait Encode<C> {
     fn encode(&self, buf: &mut [u8]) -> Result<usize, CodecError>;
@@ -26,7 +31,7 @@ where
     T: Serialize,
 {
     fn encode(&self, buf: &mut [u8]) -> Result<usize, CodecError> {
-        serde_json_core::to_slice(self, buf).map_err(|_| CodecError {})
+        serde_json_core::to_slice(self, buf).map_err(|_| CodecError::Unknown)
     }
 }
 
@@ -35,7 +40,7 @@ where
     T: Deserialize<'a>,
 {
     fn decode(buf: &'a [u8]) -> Result<Self, CodecError> {
-        serde_json_core::from_slice(buf).map(|(value, _)| value).map_err(|_| CodecError {})
+        serde_json_core::from_slice(buf).map(|(value, _)| value).map_err(|_| CodecError::Unknown)
     }
 }
 
@@ -45,7 +50,7 @@ where
     T: Serialize,
 {
     fn encode(&self, buf: &mut [u8]) -> Result<usize, CodecError> {
-        postcard::to_slice(self, buf).map(|encoded| encoded.len()).map_err(|_| CodecError {})
+        postcard::to_slice(self, buf).map(|encoded| encoded.len()).map_err(|_| CodecError::Unknown)
     }
 }
 
@@ -54,6 +59,6 @@ where
     T: Deserialize<'a>,
 {
     fn decode(buf: &'a [u8]) -> Result<Self, CodecError> {
-        postcard::from_bytes(buf).map_err(|_| CodecError {})
+        postcard::from_bytes(buf).map_err(|_| CodecError::Unknown)
     }
 }
