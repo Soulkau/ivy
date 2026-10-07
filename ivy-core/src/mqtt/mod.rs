@@ -32,7 +32,7 @@ use crate::{
     mqtt::subscription::ErasedSubscription,
 };
 
-mod subscription;
+pub mod subscription;
 
 pub type MqttTcpClientState<const TCP: usize> = TcpClientState<1, TCP, TCP>;
 pub type MqttTcpClient<const TCP: usize> = TcpClient<'static, 1, TCP, TCP>;
