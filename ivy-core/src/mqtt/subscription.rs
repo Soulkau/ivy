@@ -5,9 +5,9 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal}
 use crate::codecs::{Codec, CodecError, Decode};
 
 ///Trait alias for types that can be decoded inside of MqttSubscription
-pub trait Decodable<C>: for<'a> Decode<'a, C> + Send + 'static {}
+pub trait Decodable<C: Codec>: for<'a> Decode<'a, C> + Send + 'static {}
 ///Blanket impl of any Codec<T> type that is Send
-impl<T, C> Decodable<C> for T where T: for<'a> Decode<'a, C> + Send + 'static {}
+impl<T, C: Codec> Decodable<C> for T where T: for<'a> Decode<'a, C> + Send + 'static {}
 
 #[derive(Clone, Copy)]
 pub struct Subscription<T: 'static, C>
