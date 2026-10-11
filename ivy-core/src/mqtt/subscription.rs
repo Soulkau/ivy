@@ -2,7 +2,7 @@ use core::marker::PhantomData;
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 
-use crate::codecs::{Codec, CodecError, Decode};
+use crate::codecs::{Codec, CodecError, Decode, Json};
 
 ///Trait alias for types that can be decoded inside of `Subscription`
 pub trait Decodable<C: Codec>: for<'a> Decode<'a, C> + Send + 'static {}
@@ -10,7 +10,7 @@ pub trait Decodable<C: Codec>: for<'a> Decode<'a, C> + Send + 'static {}
 impl<T, C: Codec> Decodable<C> for T where T: for<'a> Decode<'a, C> + Send + 'static {}
 
 #[derive(Clone, Copy)]
-pub struct Subscription<T: 'static, C>
+pub struct Subscription<T: 'static, C = Json>
 where
     T: Decodable<C>,
     C: Codec,
