@@ -1,8 +1,8 @@
 use proc_macro::TokenStream;
 
-mod mqtt;
+mod subscriber;
 
 #[proc_macro]
-pub fn subscribe(input: TokenStream) -> TokenStream {
-    mqtt::expand_subscription(input)
+pub fn __subscribe_internal(input: TokenStream) -> TokenStream {
+    subscriber::expand_subscription(input)
 }
