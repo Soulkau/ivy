@@ -4,7 +4,7 @@ version = "0.2.5"
 edition = "2024"
 
 [workspace]
-members=["ivy-core", "ivy-types", "ivy-macros"]
+members=["ivy-core", "ivy-types", "ivy-macros", "ivy-app-macros"]
 resolver="2"
 exclude = [
     "templates"
@@ -62,3 +62,4 @@ critical-section = { version = "1.2.0", features = ["std"] }
 ivy-core = { path = "./ivy-core" }
 ivy-macros = { path = "./ivy-macros" }
 ivy-types = { path = "./ivy-types" }
+ivy-app-macros = {path = "./ivy-app-macros"}
