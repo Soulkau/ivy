@@ -9,7 +9,6 @@ pub trait Decodable<C: Codec>: for<'a> Decode<'a, C> + Send + 'static {}
 ///Blanket impl of any Codec<T> type that is Send
 impl<T, C: Codec> Decodable<C> for T where T: for<'a> Decode<'a, C> + Send + 'static {}
 
-#[derive(Clone, Copy)]
 pub struct Subscription<T: 'static, C = Json>
 where
     T: Decodable<C>,
@@ -18,6 +17,23 @@ where
     topic: &'static str,
     signal: &'static Signal<CriticalSectionRawMutex, T>,
     _codec: PhantomData<fn() -> C>,
+}
+
+impl<T, C> Clone for Subscription<T, C>
+where
+    T: Decodable<C>,
+    C: Codec,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T, C> Copy for Subscription<T, C>
+where
+    T: Decodable<C>,
+    C: Codec,
+{
 }
 
 impl<T, C> Subscription<T, C>
