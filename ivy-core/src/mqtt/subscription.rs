@@ -4,7 +4,7 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal}
 
 use crate::codecs::{Codec, CodecError, Decode};
 
-///Trait alias for types that can be decoded inside of MqttSubscription
+///Trait alias for types that can be decoded inside of `Subscription`
 pub trait Decodable<C: Codec>: for<'a> Decode<'a, C> + Send + 'static {}
 ///Blanket impl of any Codec<T> type that is Send
 impl<T, C: Codec> Decodable<C> for T where T: for<'a> Decode<'a, C> + Send + 'static {}
@@ -53,47 +53,4 @@ where
         self.signal.signal(value);
         Ok(())
     }
-}
-
-/// Macro to pre-declares subscriptions, that will be managed by mqtt durning app lifetime.
-#[macro_export]
-macro_rules! declare_subcriptions {
-    ( $( $name:ident => $topic:literal : $payload:ty ),+ $(,)? ) => {
-        {
-            $crate::paste::paste! {
-                $(
-                    static [<$name:upper _SIGNAL>]: ::embassy_sync::signal::Signal<
-                        ::embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-                        $payload,
-                    > = ::embassy_sync::signal::Signal::new();
-                )+
-                pub struct SubscriberReg {
-                    $( pub $name: $crate::mqtt::TypedHandle<$payload>, )+
-                }
-                impl SubscriberReg {
-                    fn new() -> Self {
-                        Self {
-                            $( $name: $crate::mqtt::TypedHandle::new(&[<$name:upper _SIGNAL>]), )+
-                        }
-                    }
-                }
-            }
-            // everything below is OUTSIDE paste!, so $crate:: stays intact
-            static SUBSCRIBER_REG: ::static_cell::StaticCell<SubscriberReg> =
-                ::static_cell::StaticCell::new();
-            let reg: &'static SubscriberReg = SUBSCRIBER_REG.init(SubscriberReg::new());
-            let handles: [(&'static str, &'static dyn $crate::mqtt::ErasedHandle); $crate::count!($($name)+)] = [
-                $( ($topic, &reg.$name as &'static dyn $crate::mqtt::ErasedHandle), )+
-            ];
-            let subs = $crate::paste::paste! {
-                ( $( $crate::mqtt::Subscription::new(&[<$name:upper _SIGNAL>]), )+ )
-            };
-            (handles, subs)
-        }
-    };
-}
-#[macro_export]
-macro_rules! count {
-    () => { 0 };
-    ($_head:ident $($tail:ident)*) => { 1 + count!($($tail)*) };
 }
