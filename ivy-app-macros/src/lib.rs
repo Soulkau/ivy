@@ -1,8 +1,8 @@
 use proc_macro::TokenStream;
 
-mod subscriber;
+mod subscription;
 
 #[proc_macro]
 pub fn __subscribe_internal(input: TokenStream) -> TokenStream {
-    subscriber::expand_subscription(input)
+    subscription::expand_subscription(input)
 }
