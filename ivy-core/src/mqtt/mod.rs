@@ -1,7 +1,9 @@
-use core::{net::Ipv4Addr};
+use core::net::Ipv4Addr;
 
 use alloc::boxed::Box;
 use core::alloc::Allocator;
+use core::str::FromStr;
+use serde::ser;
 
 use embassy_futures::{
     join::join,
@@ -94,6 +96,12 @@ impl<const B: usize> SizedMqttHandle<B> {
     }
 }
 
+pub struct MqttServerConfig {
+    pub host: String<255>,
+    pub port: u16,
+    pub crt: &'static [u8],
+}
+
 pub struct MqttCredentials {
     pub client_id: String<64>,
     pub username: String<64>,
@@ -149,7 +157,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
 }
 
 impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, const TLS: usize> MqttModule<Rng, S, NET, TCP, TLS> {
-    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, creds: MqttCredentials, subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
+    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, creds: MqttCredentials, server: MqttServerConfig, subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
         tracing::info!(tag = "mqtt", "creating mqtt module");
         static CREDS: StaticCell<MqttCredentials> = StaticCell::new();
         let creds = CREDS.init(creds);
@@ -169,10 +177,16 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
             .password(creds.password.as_bytes())
             .username(creds.username.as_str())
             .build();
-
+        tracing::info!(tag = "mqtt", "Attempting to parse host: '{}'", server.host.as_str());
         let (mqtt_stack, client) = mqttrust::new(res.mqtt_state, configuration);
         let provider = UnsecureProvider::new::<Aes128GcmSha256>(res.rng);
-        let transport = TlsNalTransport::new(res.tcp_client, IpBroker::new(Ipv4Addr::new(217, 195, 48, 206), 1883), res.tls_state, res.tls_config, provider);
+        let transport = TlsNalTransport::new(
+            res.tcp_client,
+            IpBroker::new(Ipv4Addr::from_str(&server.host).expect("Failed to parse server address"), server.port),
+            res.tls_state,
+            res.tls_config,
+            provider,
+        );
 
         tracing::info!(tag = "mqtt", "created mqtt module");
         Self {
