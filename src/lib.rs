@@ -9,6 +9,7 @@ pub use ivy_types::actor;
 pub mod __private {
     pub use ivy_core as core;
     pub use ivy_core::__private::*;
+    pub use ivy_types as types;
 }
 
 #[doc(hidden)]
