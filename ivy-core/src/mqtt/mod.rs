@@ -3,7 +3,6 @@ use core::net::Ipv4Addr;
 use alloc::boxed::Box;
 use core::alloc::Allocator;
 use core::str::FromStr;
-use serde::ser;
 
 use embassy_futures::{
     join::join,
@@ -15,7 +14,7 @@ use embassy_net::{
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
-use embedded_tls::{Aes128GcmSha256, CryptoRngCore, TlsConfig, UnsecureProvider};
+use embedded_tls::{CryptoRngCore, TlsConfig};
 use heapless::String;
 use ivy_macros::actor_handle;
 use ivy_types::actor::{Actor, rt::launder_slice};
@@ -30,17 +29,17 @@ use static_cell::StaticCell;
 use crate::{
     codecs::{Codec, CodecError, Encode},
     logger::{LOG_SIZE, LogConsumer, LogSink, TAG_SIZE},
-    mqtt::subscription::ErasedSubscription,
+    mqtt::{cert::MqttTlsProvider, subscription::ErasedSubscription},
 };
 
+pub mod cert;
 pub mod subscription;
 
 // Aliases for a TCP client state with 1 connection slot for mqtt.
 pub type MqttTcpClientState<const TCP: usize> = TcpClientState<1, TCP, TCP>;
 pub type MqttTcpClient<const TCP: usize> = TcpClient<'static, 1, TCP, TCP>;
 pub type MqttTlsState<const TLS: usize> = TlsState<TLS, TLS>;
-pub type MqttTlsTransport<Rng, const TCP: usize, const TLS: usize> = TlsNalTransport<'static, MqttTcpClient<TCP>, IpBroker, MqttProvider<Rng>, TLS, TLS>;
-type MqttProvider<Rng> = UnsecureProvider<'static, Aes128GcmSha256, Rng>;
+pub type MqttTlsTransport<Rng, const TCP: usize, const TLS: usize> = TlsNalTransport<'static, MqttTcpClient<TCP>, IpBroker, MqttTlsProvider<Rng>, TLS, TLS>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MqttError {
@@ -99,7 +98,6 @@ impl<const B: usize> SizedMqttHandle<B> {
 pub struct MqttServerConfig {
     pub host: String<255>,
     pub port: u16,
-    pub crt: &'static [u8],
 }
 
 pub struct MqttCredentials {
@@ -108,12 +106,28 @@ pub struct MqttCredentials {
     pub password: String<64>,
 }
 
+static TLS_CONFIG: StaticCell<TlsConfig<'static>> = StaticCell::new();
+
+pub struct MqttCertConfig {
+    pub certificate: &'static [u8],
+    pub host_name: &'static str,
+}
+
+impl MqttCertConfig {
+    pub fn new(certificate: &'static [u8], host_name: &'static str) -> Self {
+        Self { certificate, host_name }
+    }
+
+    fn build(self) -> &'static TlsConfig<'static> {
+        TLS_CONFIG.init_with(|| TlsConfig::new().enable_rsa_signatures().with_server_name(self.host_name))
+    }
+}
+
 pub struct MqttResources<Rng: CryptoRngCore + 'static, const NET: usize = 4096, const TCP: usize = 4096, const TLS: usize = 16640> {
     pub network_stack: Stack<'static>,
     pub mqtt_state: &'static mut State<CriticalSectionRawMutex, NET, NET>,
     pub tls_state: &'static mut MqttTlsState<TLS>,
     pub tcp_client: &'static mut MqttTcpClient<TCP>,
-    pub tls_config: &'static TlsConfig<'static>,
     pub rng: Rng,
 }
 
@@ -129,7 +143,6 @@ impl<Rng: CryptoRngCore + 'static, const NET: usize, const TCP: usize, const TLS
             mqtt_state: leak_in(MqttState::new(), alloc),
             tls_state: leak_in(MqttTlsState::new(), alloc),
             tcp_client: leak_in(MqttTcpClient::new(stack, leak_in(MqttTcpClientState::new(), alloc)), alloc),
-            tls_config: leak_in(TlsConfig::default().enable_rsa_signatures(), alloc),
             rng,
         }
     }
@@ -157,7 +170,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
 }
 
 impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, const TLS: usize> MqttModule<Rng, S, NET, TCP, TLS> {
-    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, creds: MqttCredentials, server: MqttServerConfig, subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
+    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, creds: MqttCredentials, server: MqttServerConfig, certc: MqttCertConfig, subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
         tracing::info!(tag = "mqtt", "creating mqtt module");
         static CREDS: StaticCell<MqttCredentials> = StaticCell::new();
         let creds = CREDS.init(creds);
@@ -179,12 +192,13 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
             .build();
         tracing::info!(tag = "mqtt", "Attempting to parse host: '{}'", server.host.as_str());
         let (mqtt_stack, client) = mqttrust::new(res.mqtt_state, configuration);
-        let provider = UnsecureProvider::new::<Aes128GcmSha256>(res.rng);
+
+        let provider = MqttTlsProvider::new(res.rng, certc.certificate);
         let transport = TlsNalTransport::new(
             res.tcp_client,
             IpBroker::new(Ipv4Addr::from_str(&server.host).expect("Failed to parse server address"), server.port),
             res.tls_state,
-            res.tls_config,
+            certc.build(),
             provider,
         );
 
@@ -317,7 +331,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
                         }
                     }
                     None => {
-                        tracing::error!(tag = "mqtt", "received none");
+                        tracing::error!(tag = "mqtt", "received none message in sub task");
                     }
                 }
             }
