@@ -81,7 +81,7 @@ impl<const B: usize> SizedMqttHandle<B> {
         self.raw.clone()
     }
 
-    pub async fn publish<C: Codec, T: Encode<C>>(&self, topic: &'static str, data: T) -> Result<(), MqttError> {
+    pub async fn publish<C: Codec>(&self, topic: &'static str, data: impl Encode<C>) -> Result<(), MqttError> {
         let mut buffer = [0u8; B];
         let payload = match data.encode(&mut buffer) {
             Ok(payload) => payload,
