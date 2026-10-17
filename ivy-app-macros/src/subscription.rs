@@ -1,14 +1,14 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Error, Ident, LitStr, Path, Result, Token, Type,
+    Error, Expr, Ident, LitStr, Path, Result, Token, Type,
     parse::{Parse, ParseStream},
     parse_macro_input,
 };
 
 struct SubscriptionInput {
     ivy: Path,
-    topic: LitStr,
+    topic: Expr,
     ty: Type,
     codec: Path,
 }
@@ -19,7 +19,7 @@ impl Parse for SubscriptionInput {
         let ivy: Path = input.parse()?;
         input.parse::<Token![,]>()?;
 
-        let topic: LitStr = input.parse()?;
+        let topic: Expr = input.parse()?;
         input.parse::<Token![,]>()?;
         let ty: Type = input.parse()?;
 
