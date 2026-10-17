@@ -1,3 +1,12 @@
+//! MQTT support.
+//!
+//! `MqttModule` is an actor. It keeps the connection to the broker alive,
+//! sends publish requests that come from handles, and passes incoming
+//! messages to `Subscription`s.
+//!
+//! To publish, use `SizedMqttHandle` (or `RawMqttHandle` if you manage buffers yourself).
+//! To receive, create a `Subscription` and pass it to `MqttModule::new`.
+
 use core::net::Ipv4Addr;
 
 use alloc::boxed::Box;
@@ -35,23 +44,32 @@ pub mod cert;
 pub mod subscription;
 
 // Aliases for a TCP client state with 1 connection slot for mqtt.
+/// TCP client state with 1 connection slot for mqtt. `TCP` is the buffer size in bytes.
 pub type MqttTcpClientState<const TCP: usize> = TcpClientState<1, TCP, TCP>;
+/// TCP client with 1 connection slot for mqtt. `TCP` is the buffer size in bytes.
 pub type MqttTcpClient<const TCP: usize> = TcpClient<'static, 1, TCP, TCP>;
+/// TLS state for mqtt. `TLS` is the buffer size in bytes.
 pub type MqttTlsState<const TLS: usize> = TlsState<TLS, TLS>;
+/// TLS transport that mqtt runs on top of.
 pub type MqttTlsTransport<Rng, const TCP: usize, const TLS: usize> = TlsNalTransport<'static, MqttTcpClient<TCP>, IpBroker, MqttTlsProvider<Rng>, TLS, TLS>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MqttError {
+    /// Failed to encode or decode data.
     #[error("decode error: {0}")]
     Codec(#[from] CodecError),
+    /// The mqtt client returned an error.
     #[error("mqtt client error: {0:?}")]
     MqttClient(mqttrust::Error),
+    /// There is no connection to the broker right now.
     #[error("Disconnected")]
     Disconnected,
 }
 
 #[actor_handle(RawMqttHandle)]
 pub trait MqttHandle {
+    /// Publishes `payload` to `topic`. Use `RawMqttHandle::publish` instead,
+    /// it is the safe-ish wrapper around this.
     async fn __publish(&self, topic: &'static str, payload: &'static [u8]) -> Result<(), MqttError>;
 }
 
@@ -70,7 +88,7 @@ impl<const S: usize> From<RawMqttHandle> for SizedMqttHandle<S> {
         Self { raw }
     }
 }
-
+/// Simple implemenation of handle that uses fixed size buffer to serialize data.
 pub struct SizedMqttHandle<const B: usize> {
     raw: RawMqttHandle,
 }
@@ -79,7 +97,9 @@ impl<const B: usize> SizedMqttHandle<B> {
     pub fn as_raw(&self) -> RawMqttHandle {
         self.raw.clone()
     }
-
+    /// Simple handle that serializes data into a fixed size buffer on the stack.
+    ///
+    /// `B` is the buffer size in bytes. Data that doesn't fit will fail to encode.
     pub async fn publish<C: Codec>(&self, topic: &'static str, data: impl Encode<C>) -> Result<(), MqttError> {
         let mut buffer = [0u8; B];
         let payload = match data.encode(&mut buffer) {
@@ -93,17 +113,24 @@ impl<const B: usize> SizedMqttHandle<B> {
         unsafe { self.raw.publish(topic, launder_slice(&buffer[..payload])).await }
     }
 }
-
+/// Mqtt config.
 #[derive(Clone, Copy)]
 pub struct MqttConfig {
+    /// IPv4 address of the broker, like `"192.168.1.10"`. Hostnames are not supported.
     pub host: &'static str,
+    /// Port of the broker.
     pub port: u16,
-    pub host_name: &'static str, // имя для TLS, уходит в MqttCertConfig
+    /// Server name used for tls. Must match the broker's certificate.
+    pub host_name: &'static str,
+    /// Client id sent to the broker.
     pub client_id: &'static str,
     pub username: &'static str,
     pub password: &'static str,
 }
 
+/// Holds all net resources needed for the mqtt connection.
+///
+/// `NET` is the mqtt buffer size, `TCP` is the tcp buffer size and `TLS` is the tls buffer size (all in bytes).
 pub struct MqttResources<Rng: CryptoRngCore + 'static, const NET: usize = 4096, const TCP: usize = 4096, const TLS: usize = 16640> {
     pub network_stack: Stack<'static>,
     pub mqtt_state: &'static mut State<CriticalSectionRawMutex, NET, NET>,
@@ -112,7 +139,7 @@ pub struct MqttResources<Rng: CryptoRngCore + 'static, const NET: usize = 4096, 
     pub rng: Rng,
 }
 
-// Accept &A instead of A by value
+/// Little helper function for leaking values into Boxes
 fn leak_in<T, A: Allocator>(value: T, alloc: &'static A) -> &'static mut T {
     Box::leak(Box::new_in(value, alloc))
 }
@@ -129,6 +156,12 @@ impl<Rng: CryptoRngCore + 'static, const NET: usize, const TCP: usize, const TLS
     }
 }
 
+/// Actor that runs the mqtt connection.
+///
+/// It reconnects when the connection drops, sends publish requests from handles
+/// and passes incoming messages to the subscribers. `S` is the number of subscribers.
+///
+/// While there is no connection, publish requests fail with `MqttError::Disconnected`.
 pub struct MqttModule<Rng: CryptoRngCore + 'static, const S: usize, const NET: usize = 4096, const TCP: usize = 4096, const TLS: usize = 16640> {
     subscribers: [&'static dyn ErasedSubscription; S],
     network_stack: Stack<'static>,
@@ -251,7 +284,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
     }
 
     /// Handles inbox commands
-    /// NOTE: logging here is not permited, as it would cause loop issues for logs
+    /// NOTE: logging here is not permited, as it would cause log recursion
     async fn handle_inbox_task(client: &MqttClient<'static, CriticalSectionRawMutex>, inbox: &mut ivy_types::actor::Inbox<<RawMqttHandle as ivy_types::actor::ActorHandle>::Cmd>) {
         loop {
             match inbox.next().await {
@@ -321,14 +354,19 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
     }
 }
 
+/// Extra bytes on top of the log and tag size, to fit the json around them.
 const DEFAULT_LOG_OVERHEAD: usize = 100;
 
+/// Sends logs to `log_topic` over mqtt.
+///
+/// Logs that fail to serialize or publish are dropped silently.
 pub struct MqttLogger {
     log_topic: &'static str,
     handle: RawMqttHandle,
 }
 
 impl MqttLogger {
+    /// Creates a logger that publishes to `log_topic` using `handle`.
     pub fn new(log_topic: &'static str, handle: RawMqttHandle) -> Self {
         Self { log_topic, handle }
     }

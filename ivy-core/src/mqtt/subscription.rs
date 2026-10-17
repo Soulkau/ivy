@@ -9,6 +9,9 @@ pub trait Decodable<C: Codec>: for<'a> Decode<'a, C> + Send + 'static {}
 ///Blanket impl of any Codec<T> type that is Send
 impl<T, C: Codec> Decodable<C> for T where T: for<'a> Decode<'a, C> + Send + 'static {}
 
+/// Struct to poll messages for `topic`
+///
+/// Used by both: `MqttModule` to dispatch messages for `topic` and user to await messages by `next`
 pub struct Subscription<T: 'static, C = Json>
 where
     T: Decodable<C>,
@@ -45,13 +48,19 @@ where
         Self { topic, signal, _codec: PhantomData }
     }
 
+    /// Waits for the next message on this subscription.
+    ///
+    /// Only the most recent message is kept: if several arrive before
+    /// this is polled, earlier ones are dropped.
     pub async fn next(&self) -> T {
         self.signal.wait().await
     }
 }
-
+/// Used by `MqttModule` to erase generics from subscriptions and dispatch messages
 pub trait ErasedSubscription: Sync {
+    ///Returns topic of subscription
     fn topic(&self) -> &'static str;
+    ///Passes buf to subscription
     fn dispatch(&self, buf: &[u8]) -> Result<(), CodecError>;
 }
 
@@ -64,6 +73,9 @@ where
         self.topic
     }
 
+    /// Dispatches message
+    ///
+    /// Note: if deserialization fails, signal is left untouched (old value stays)
     fn dispatch(&self, buf: &[u8]) -> Result<(), CodecError> {
         let value = <T as Decode<C>>::decode(buf)?;
         self.signal.signal(value);
