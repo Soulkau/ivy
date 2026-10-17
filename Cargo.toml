@@ -4,7 +4,7 @@ version = "0.2.5"
 edition = "2024"
 
 [workspace]
-members=["ivy-core", "ivy-types", "ivy-macros"]
+members=["ivy-core", "ivy-types", "ivy-macros", "ivy-app-macros"]
 resolver="2"
 exclude = [
     "templates"
@@ -36,7 +36,7 @@ embedded-io-async = "0.7.0"
 embedded-time = "0.12.1"
 embedded-storage = "0.3.1"
 embedded-storage-async = "0.4.1"
-embedded-tls = { git = "https://github.com/drogue-iot/embedded-tls", rev = "426f327", default-features = false }
+embedded-tls = { version = "0.19", default-features = false, features=["rustpki", "rsa"] }
 #Embassy
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "dns", "dhcpv4"] }
 embassy-executor = { version = "0.10.0", features = [] }
@@ -46,6 +46,7 @@ embassy-sync = "0.7.2"
 embassy-futures = "0.1.2"
 # Macros
 proc-macro2 = "1.0.106"
+proc-macro-crate="3.5.0"
 quote = "1.0.42"
 syn = {version = "3.0.3", features = ["full"] }
 heck = "0.5.0"
@@ -62,3 +63,4 @@ critical-section = { version = "1.2.0", features = ["std"] }
 ivy-core = { path = "./ivy-core" }
 ivy-macros = { path = "./ivy-macros" }
 ivy-types = { path = "./ivy-types" }
+ivy-app-macros = {path = "./ivy-app-macros"}

@@ -1,0 +1,17 @@
+[package]
+name = "ivy-app-macros"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+
+[dependencies]
+ivy-core={path="../ivy-core"}
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
+heck.workspace = true
+static_cell.workspace = true
+embassy-executor.workspace = true

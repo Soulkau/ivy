@@ -14,3 +14,4 @@ syn.workspace = true
 heck.workspace = true
 static_cell.workspace = true
 embassy-executor.workspace = true
+proc-macro-crate.workspace = true

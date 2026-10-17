@@ -1,7 +1,17 @@
+//! MQTT support.
+//!
+//! `MqttModule` is an actor. It keeps the connection to the broker alive,
+//! sends publish requests that come from handles, and passes incoming
+//! messages to `Subscription`s.
+//!
+//! To publish, use `SizedMqttHandle` (or `RawMqttHandle` if you manage buffers yourself).
+//! To receive, create a `Subscription` and pass it to `MqttModule::new`.
+
 use core::net::Ipv4Addr;
 
 use alloc::boxed::Box;
 use core::alloc::Allocator;
+use core::str::FromStr;
 
 use embassy_futures::{
     join::join,
@@ -11,90 +21,55 @@ use embassy_net::{
     Stack,
     tcp::client::{TcpClient, TcpClientState},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
-use embedded_tls::{Aes128GcmSha256, CryptoRngCore, TlsConfig, UnsecureProvider};
-use heapless::String;
+use embedded_tls::{CryptoRngCore, TlsConfig};
 use ivy_macros::actor_handle;
 use ivy_types::actor::{Actor, rt::launder_slice};
 use mqttrust::{
     Config, IpBroker, MqttClient, MqttStack, Publish, State, Subscribe, SubscribeTopic,
     transport::embedded_tls::{TlsNalTransport, TlsState},
 };
-use serde::{Serialize, de::DeserializeOwned};
 
 pub use mqttrust::State as MqttState;
 use static_cell::StaticCell;
 
-use crate::logger::{LOG_SIZE, LogConsumer, LogSink, TAG_SIZE};
+use crate::{
+    codecs::{Codec, CodecError, Encode},
+    logger::{LOG_SIZE, LogConsumer, LogSink, TAG_SIZE},
+    mqtt::{cert::MqttTlsProvider, subscription::ErasedSubscription},
+};
 
+pub mod cert;
+pub mod subscription;
+
+// Aliases for a TCP client state with 1 connection slot for mqtt.
+/// TCP client state with 1 connection slot for mqtt. `TCP` is the buffer size in bytes.
 pub type MqttTcpClientState<const TCP: usize> = TcpClientState<1, TCP, TCP>;
+/// TCP client with 1 connection slot for mqtt. `TCP` is the buffer size in bytes.
 pub type MqttTcpClient<const TCP: usize> = TcpClient<'static, 1, TCP, TCP>;
+/// TLS state for mqtt. `TLS` is the buffer size in bytes.
 pub type MqttTlsState<const TLS: usize> = TlsState<TLS, TLS>;
-pub type MqttTlsTransport<Rng, const TCP: usize, const TLS: usize> = TlsNalTransport<'static, MqttTcpClient<TCP>, IpBroker, MqttProvider<Rng>, TLS, TLS>;
-type MqttProvider<Rng> = UnsecureProvider<'static, Aes128GcmSha256, Rng>;
+/// TLS transport that mqtt runs on top of.
+pub type MqttTlsTransport<Rng, const TCP: usize, const TLS: usize> = TlsNalTransport<'static, MqttTcpClient<TCP>, IpBroker, MqttTlsProvider<Rng>, TLS, TLS>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MqttError {
+    /// Failed to encode or decode data.
     #[error("decode error: {0}")]
-    Decode(#[from] serde_json_core::de::Error),
-    #[error("encode error: {0}")]
-    Encode(#[from] serde_json_core::ser::Error),
+    Codec(#[from] CodecError),
+    /// The mqtt client returned an error.
     #[error("mqtt client error: {0:?}")]
     MqttClient(mqttrust::Error),
+    /// There is no connection to the broker right now.
     #[error("Disconnected")]
     Disconnected,
 }
 
-pub struct Subscription<T: 'static> {
-    receiver: &'static Signal<CriticalSectionRawMutex, T>,
-}
-
-impl<T: 'static> Subscription<T> {
-    pub fn new(receiver: &'static Signal<CriticalSectionRawMutex, T>) -> Self {
-        Self { receiver }
-    }
-}
-
-impl<T: 'static> Subscription<T> {
-    pub async fn next(&self) -> T {
-        self.receiver.wait().await
-    }
-}
-
-pub trait ErasedHandle: Send + Sync {
-    fn dispatch(&self, buf: &[u8]) -> Result<(), MqttError>;
-}
-
-pub struct TypedHandle<T: 'static> {
-    signal: &'static Signal<CriticalSectionRawMutex, T>,
-}
-
-impl<T: 'static> TypedHandle<T> {
-    pub fn new(signal: &'static Signal<CriticalSectionRawMutex, T>) -> Self {
-        Self { signal }
-    }
-}
-
-/* SAFETY: DynamicSender only exposes try_send, which goes through
-the channel's internal critical-section mutex - it's fine to
-call from multiple threads concurrently as long as T: Send. */
-unsafe impl<T: Send + 'static> Sync for TypedHandle<T> {}
-unsafe impl<T: Send + 'static> Send for TypedHandle<T> {}
-
-impl<T> ErasedHandle for TypedHandle<T>
-where
-    T: DeserializeOwned + Send + Sync + 'static,
-{
-    fn dispatch(&self, buf: &[u8]) -> Result<(), MqttError> {
-        let (value, _) = serde_json_core::from_slice(buf).map_err(MqttError::Decode)?;
-        self.signal.signal(value);
-        Ok(())
-    }
-}
-
 #[actor_handle(RawMqttHandle)]
 pub trait MqttHandle {
+    /// Publishes `payload` to `topic`. Use `RawMqttHandle::publish` instead,
+    /// it is the safe-ish wrapper around this.
     async fn __publish(&self, topic: &'static str, payload: &'static [u8]) -> Result<(), MqttError>;
 }
 
@@ -113,7 +88,7 @@ impl<const S: usize> From<RawMqttHandle> for SizedMqttHandle<S> {
         Self { raw }
     }
 }
-
+/// Simple implemenation of handle that uses fixed size buffer to serialize data.
 pub struct SizedMqttHandle<const B: usize> {
     raw: RawMqttHandle,
 }
@@ -122,13 +97,15 @@ impl<const B: usize> SizedMqttHandle<B> {
     pub fn as_raw(&self) -> RawMqttHandle {
         self.raw.clone()
     }
-
-    pub async fn publish<S: Serialize>(&self, topic: &'static str, data: S) -> Result<(), MqttError> {
+    /// Simple handle that serializes data into a fixed size buffer on the stack.
+    ///
+    /// `B` is the buffer size in bytes. Data that doesn't fit will fail to encode.
+    pub async fn publish<C: Codec>(&self, topic: &'static str, data: impl Encode<C>) -> Result<(), MqttError> {
         let mut buffer = [0u8; B];
-        let payload = match serde_json_core::to_slice(&data, &mut buffer) {
+        let payload = match data.encode(&mut buffer) {
             Ok(payload) => payload,
             Err(e) => {
-                return Err(MqttError::Encode(e));
+                return Err(MqttError::Codec(e));
             }
         };
         /*  SAFETY: `buffer` outlives the request - it's not touched again until this
@@ -136,23 +113,33 @@ impl<const B: usize> SizedMqttHandle<B> {
         unsafe { self.raw.publish(topic, launder_slice(&buffer[..payload])).await }
     }
 }
-
-pub struct MqttCredentials {
-    pub client_id: String<64>,
-    pub username: String<64>,
-    pub password: String<64>,
+/// Mqtt config.
+#[derive(Clone, Copy)]
+pub struct MqttConfig {
+    /// IPv4 address of the broker, like `"192.168.1.10"`. Hostnames are not supported.
+    pub host: &'static str,
+    /// Port of the broker.
+    pub port: u16,
+    /// Server name used for tls. Must match the broker's certificate.
+    pub host_name: &'static str,
+    /// Client id sent to the broker.
+    pub client_id: &'static str,
+    pub username: &'static str,
+    pub password: &'static str,
 }
 
+/// Holds all net resources needed for the mqtt connection.
+///
+/// `NET` is the mqtt buffer size, `TCP` is the tcp buffer size and `TLS` is the tls buffer size (all in bytes).
 pub struct MqttResources<Rng: CryptoRngCore + 'static, const NET: usize = 4096, const TCP: usize = 4096, const TLS: usize = 16640> {
     pub network_stack: Stack<'static>,
     pub mqtt_state: &'static mut State<CriticalSectionRawMutex, NET, NET>,
     pub tls_state: &'static mut MqttTlsState<TLS>,
     pub tcp_client: &'static mut MqttTcpClient<TCP>,
-    pub tls_config: &'static TlsConfig<'static>,
     pub rng: Rng,
 }
 
-// Accept &A instead of A by value
+/// Little helper function for leaking values into Boxes
 fn leak_in<T, A: Allocator>(value: T, alloc: &'static A) -> &'static mut T {
     Box::leak(Box::new_in(value, alloc))
 }
@@ -164,14 +151,19 @@ impl<Rng: CryptoRngCore + 'static, const NET: usize, const TCP: usize, const TLS
             mqtt_state: leak_in(MqttState::new(), alloc),
             tls_state: leak_in(MqttTlsState::new(), alloc),
             tcp_client: leak_in(MqttTcpClient::new(stack, leak_in(MqttTcpClientState::new(), alloc)), alloc),
-            tls_config: leak_in(TlsConfig::default().enable_rsa_signatures(), alloc),
             rng,
         }
     }
 }
 
+/// Actor that runs the mqtt connection.
+///
+/// It reconnects when the connection drops, sends publish requests from handles
+/// and passes incoming messages to the subscribers. `S` is the number of subscribers.
+///
+/// While there is no connection, publish requests fail with `MqttError::Disconnected`.
 pub struct MqttModule<Rng: CryptoRngCore + 'static, const S: usize, const NET: usize = 4096, const TCP: usize = 4096, const TLS: usize = 16640> {
-    subscribers: [(&'static str, &'static dyn ErasedHandle); S],
+    subscribers: [&'static dyn ErasedSubscription; S],
     network_stack: Stack<'static>,
     mqtt_stack: MqttStack<'static, CriticalSectionRawMutex>,
     client: MqttClient<'static, CriticalSectionRawMutex>,
@@ -184,24 +176,21 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
         tracing::debug!(tag = "mqtt", "started acting");
         let mqtt_stack_task = Self::run_stack_task(&mut self.mqtt_stack, &mut self.transport, self.network_stack.clone());
         tracing::debug!(tag = "mqtt", "mqtt task was created");
-        let topics: [SubscribeTopic<'static>; S] = core::array::from_fn(|i| {
-            let (name, _handle) = self.subscribers[i];
-            name.into()
-        });
 
-        let client_task = Self::run_client_task(&self.subscribers, &self.client, &topics, &mut inbox);
+        let client_task = Self::run_client_task(&self.subscribers, &self.client, &mut inbox);
         tracing::debug!(tag = "mqtt", "client task was created");
         join(client_task, mqtt_stack_task).await.1
     }
 }
 
 impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, const TLS: usize> MqttModule<Rng, S, NET, TCP, TLS> {
-    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, creds: MqttCredentials, subscribers: [(&'static str, &'static dyn ErasedHandle); S]) -> Self {
+    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, config: MqttConfig, ca: &'static [u8], subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
         tracing::info!(tag = "mqtt", "creating mqtt module");
-        static CREDS: StaticCell<MqttCredentials> = StaticCell::new();
-        let creds = CREDS.init(creds);
+        static TLS_CONFIG: StaticCell<TlsConfig<'static>> = StaticCell::new();
+
+        let tls_config = TLS_CONFIG.init_with(|| TlsConfig::new().enable_rsa_signatures().with_server_name(config.host_name));
         let configuration = Config::builder()
-            .client_id(creds.client_id.clone())
+            .client_id(config.client_id.try_into().expect("Failed to convert into client_id"))
             .connect_timeout(Duration::from_secs(20))
             .backoff_algo(|attempt| {
                 let max_attempts = 7;
@@ -213,13 +202,20 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
 
                 Some(Duration::from_millis(backoff.into()))
             })
-            .password(creds.password.as_bytes())
-            .username(creds.username.as_str())
+            .password(config.password.as_bytes())
+            .username(config.username)
             .build();
-
+        tracing::info!(tag = "mqtt", "Using host: '{}'", config.host);
         let (mqtt_stack, client) = mqttrust::new(res.mqtt_state, configuration);
-        let provider = UnsecureProvider::new::<Aes128GcmSha256>(res.rng);
-        let transport = TlsNalTransport::new(res.tcp_client, IpBroker::new(Ipv4Addr::new(217, 195, 48, 206), 1883), res.tls_state, res.tls_config, provider);
+
+        let provider = MqttTlsProvider::new(res.rng, ca);
+        let transport = TlsNalTransport::new(
+            res.tcp_client,
+            IpBroker::new(Ipv4Addr::from_str(&config.host).expect("Failed to parse server address"), config.port),
+            res.tls_state,
+            tls_config,
+            provider,
+        );
 
         tracing::info!(tag = "mqtt", "created mqtt module");
         Self {
@@ -247,9 +243,8 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
     /// Runs the main mqtt client task loop: waits for connection, races background workers
     /// against disconnect detection, then drains the inbox until reconnected.
     async fn run_client_task(
-        subscribers: &[(&'static str, &'static dyn ErasedHandle); S],
+        subscribers: &[&'static dyn ErasedSubscription; S],
         client: &MqttClient<'static, CriticalSectionRawMutex>,
-        topics: &[SubscribeTopic<'static>; S],
         inbox: &mut ivy_types::actor::Inbox<<RawMqttHandle as ivy_types::actor::ActorHandle>::Cmd>,
     ) -> ! {
         loop {
@@ -258,7 +253,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
             tracing::debug!(tag = "mqtt", "connected, starting worker tasks");
             // Neither of those tasks, should ever return. Only point of failure is mqtt_client itself, if connection lost all of tasks would be cancelled anyways.
             let inbox_task = Self::handle_inbox_task(client, inbox);
-            let sub_task = Self::handle_subscriptions(subscribers, client, topics);
+            let sub_task = Self::handle_subscriptions(subscribers, client);
             let disconnect_watch = Self::wait_for_disconnect(client);
 
             // Neither of those futures, besides disconnect_watch ever returns.
@@ -289,7 +284,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
     }
 
     /// Handles inbox commands
-    /// NOTE: logging here is not permited, as it would cause loop issues for logs
+    /// NOTE: logging here is not permited, as it would cause log recursion
     async fn handle_inbox_task(client: &MqttClient<'static, CriticalSectionRawMutex>, inbox: &mut ivy_types::actor::Inbox<<RawMqttHandle as ivy_types::actor::ActorHandle>::Cmd>) {
         loop {
             match inbox.next().await {
@@ -306,11 +301,16 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
             }
         }
     }
+
     /// Manages subscriptions
-    async fn handle_subscriptions(subscribers: &[(&'static str, &'static dyn ErasedHandle); S], client: &MqttClient<'static, CriticalSectionRawMutex>, topics: &[SubscribeTopic<'static>; S]) -> ! {
+    async fn handle_subscriptions(subscribers: &[&'static dyn ErasedSubscription; S], client: &MqttClient<'static, CriticalSectionRawMutex>) -> ! {
+        let topics: &[SubscribeTopic<'static>] = &subscribers.map(|sub| sub.topic().into());
+
         loop {
             tracing::debug!(tag = "mqtt", "subscribing to topics");
+
             let mut back_off_ms = 2000;
+
             let mut subscription = loop {
                 let sub_pkt = Subscribe::builder().topics(topics).build();
 
@@ -321,82 +321,52 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
                     }
                     Err(e) => {
                         tracing::error!(tag = "mqtt", "subscribe failed: {:?}. retrying in {}ms...", e, back_off_ms);
+
                         Timer::after(Duration::from_millis(back_off_ms)).await;
                         back_off_ms = (back_off_ms * 3 / 2).min(20000);
                     }
                 }
             };
+
             loop {
                 match subscription.next_message().await {
                     Some(msg) => {
-                        let handle = subscribers.iter().find(|(name, _)| *name == msg.topic_name());
-                        let Some(handle) = handle else {
+                        let Some(subscriber) = subscribers.iter().find(|sub| sub.topic() == msg.topic_name()) else {
                             tracing::warn!(tag = "mqtt", "no handle found for topic {}", msg.topic_name());
                             continue;
                         };
-                        let Err(e) = handle.1.dispatch(&msg.payload()) else {
-                            tracing::debug!(tag = "mqtt", "dispatched message for topic {}", msg.topic_name());
-                            continue;
-                        };
-                        tracing::error!(tag = "mqtt", "failed to dispatch error: {}", e);
+
+                        match subscriber.dispatch(msg.payload()) {
+                            Ok(()) => {
+                                tracing::debug!(tag = "mqtt", "dispatched message for topic {}", msg.topic_name());
+                            }
+                            Err(e) => {
+                                tracing::error!(tag = "mqtt", "failed to dispatch message for topic {}: {}", msg.topic_name(), e);
+                            }
+                        }
                     }
-                    None => tracing::error!(tag = "mqtt", "received none"),
+                    None => {
+                        tracing::error!(tag = "mqtt", "received none message in sub task");
+                    }
                 }
             }
         }
     }
 }
-/// Macro to pre-declares subscriptions, that will be managed by mqtt durning app lifetime.
-#[macro_export]
-macro_rules! declare_subcriptions {
-    ( $( $name:ident => $topic:literal : $payload:ty ),+ $(,)? ) => {
-        {
-            $crate::paste::paste! {
-                $(
-                    static [<$name:upper _SIGNAL>]: ::embassy_sync::signal::Signal<
-                        ::embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-                        $payload,
-                    > = ::embassy_sync::signal::Signal::new();
-                )+
-                pub struct SubscriberReg {
-                    $( pub $name: $crate::mqtt::TypedHandle<$payload>, )+
-                }
-                impl SubscriberReg {
-                    fn new() -> Self {
-                        Self {
-                            $( $name: $crate::mqtt::TypedHandle::new(&[<$name:upper _SIGNAL>]), )+
-                        }
-                    }
-                }
-            }
-            // everything below is OUTSIDE paste!, so $crate:: stays intact
-            static SUBSCRIBER_REG: ::static_cell::StaticCell<SubscriberReg> =
-                ::static_cell::StaticCell::new();
-            let reg: &'static SubscriberReg = SUBSCRIBER_REG.init(SubscriberReg::new());
-            let handles: [(&'static str, &'static dyn $crate::mqtt::ErasedHandle); $crate::count!($($name)+)] = [
-                $( ($topic, &reg.$name as &'static dyn $crate::mqtt::ErasedHandle), )+
-            ];
-            let subs = $crate::paste::paste! {
-                ( $( $crate::mqtt::Subscription::new(&[<$name:upper _SIGNAL>]), )+ )
-            };
-            (handles, subs)
-        }
-    };
-}
-#[macro_export]
-macro_rules! count {
-    () => { 0 };
-    ($_head:ident $($tail:ident)*) => { 1 + count!($($tail)*) };
-}
 
+/// Extra bytes on top of the log and tag size, to fit the json around them.
 const DEFAULT_LOG_OVERHEAD: usize = 100;
 
+/// Sends logs to `log_topic` over mqtt.
+///
+/// Logs that fail to serialize or publish are dropped silently.
 pub struct MqttLogger {
     log_topic: &'static str,
     handle: RawMqttHandle,
 }
 
 impl MqttLogger {
+    /// Creates a logger that publishes to `log_topic` using `handle`.
     pub fn new(log_topic: &'static str, handle: RawMqttHandle) -> Self {
         Self { log_topic, handle }
     }

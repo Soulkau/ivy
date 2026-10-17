@@ -10,18 +10,21 @@ pub mod logger;
 pub mod mqtt;
 pub mod wifi;
 
-pub use ivy_macros as macros;
-pub use ivy_types as types;
-pub use ivy_types::actor;
-
-pub use paste;
-
 extern crate alloc;
+
+#[doc(hidden)]
+pub mod __private {
+    pub use embassy_sync;
+    pub use paste;
+    pub use static_cell;
+}
 
 #[macro_export]
 macro_rules! mk_static {
     ($t:ty, $val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        STATIC_CELL.init(($val))
+        use $crate::__private::static_cell::StaticCell;
+
+        static CELL: StaticCell<$t> = StaticCell::new();
+        CELL.init($val)
     }};
 }
