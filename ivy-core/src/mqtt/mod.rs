@@ -15,7 +15,6 @@ use embassy_net::{
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
 use embedded_tls::{CryptoRngCore, TlsConfig};
-use heapless::String;
 use ivy_macros::actor_handle;
 use ivy_types::actor::{Actor, rt::launder_slice};
 use mqttrust::{
@@ -95,32 +94,14 @@ impl<const B: usize> SizedMqttHandle<B> {
     }
 }
 
-pub struct MqttServerConfig {
-    pub host: String<255>,
+#[derive(Clone, Copy)]
+pub struct MqttConfig {
+    pub host: &'static str,
     pub port: u16,
-}
-
-pub struct MqttCredentials {
-    pub client_id: String<64>,
-    pub username: String<64>,
-    pub password: String<64>,
-}
-
-static TLS_CONFIG: StaticCell<TlsConfig<'static>> = StaticCell::new();
-
-pub struct MqttCertConfig {
-    pub certificate: &'static [u8],
-    pub host_name: &'static str,
-}
-
-impl MqttCertConfig {
-    pub fn new(certificate: &'static [u8], host_name: &'static str) -> Self {
-        Self { certificate, host_name }
-    }
-
-    fn build(self) -> &'static TlsConfig<'static> {
-        TLS_CONFIG.init_with(|| TlsConfig::new().enable_rsa_signatures().with_server_name(self.host_name))
-    }
+    pub host_name: &'static str, // имя для TLS, уходит в MqttCertConfig
+    pub client_id: &'static str,
+    pub username: &'static str,
+    pub password: &'static str,
 }
 
 pub struct MqttResources<Rng: CryptoRngCore + 'static, const NET: usize = 4096, const TCP: usize = 4096, const TLS: usize = 16640> {
@@ -170,12 +151,13 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
 }
 
 impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, const TLS: usize> MqttModule<Rng, S, NET, TCP, TLS> {
-    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, creds: MqttCredentials, server: MqttServerConfig, certc: MqttCertConfig, subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
+    pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, config: MqttConfig, ca: &'static [u8], subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
         tracing::info!(tag = "mqtt", "creating mqtt module");
-        static CREDS: StaticCell<MqttCredentials> = StaticCell::new();
-        let creds = CREDS.init(creds);
+        static TLS_CONFIG: StaticCell<TlsConfig<'static>> = StaticCell::new();
+
+        let tls_config = TLS_CONFIG.init_with(|| TlsConfig::new().enable_rsa_signatures().with_server_name(config.host_name));
         let configuration = Config::builder()
-            .client_id(creds.client_id.clone())
+            .client_id(config.client_id.try_into().expect("Failed to convert into client_id"))
             .connect_timeout(Duration::from_secs(20))
             .backoff_algo(|attempt| {
                 let max_attempts = 7;
@@ -187,18 +169,18 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
 
                 Some(Duration::from_millis(backoff.into()))
             })
-            .password(creds.password.as_bytes())
-            .username(creds.username.as_str())
+            .password(config.password.as_bytes())
+            .username(config.username)
             .build();
-        tracing::info!(tag = "mqtt", "Attempting to parse host: '{}'", server.host.as_str());
+        tracing::info!(tag = "mqtt", "Using host: '{}'", config.host);
         let (mqtt_stack, client) = mqttrust::new(res.mqtt_state, configuration);
 
-        let provider = MqttTlsProvider::new(res.rng, certc.certificate);
+        let provider = MqttTlsProvider::new(res.rng, ca);
         let transport = TlsNalTransport::new(
             res.tcp_client,
-            IpBroker::new(Ipv4Addr::from_str(&server.host).expect("Failed to parse server address"), server.port),
+            IpBroker::new(Ipv4Addr::from_str(&config.host).expect("Failed to parse server address"), config.port),
             res.tls_state,
-            certc.build(),
+            tls_config,
             provider,
         );
 
