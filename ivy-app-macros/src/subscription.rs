@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Error, Expr, Ident, LitStr, Path, Result, Token, Type,
+    Error, Expr, Ident, Path, Result, Token, Type,
     parse::{Parse, ParseStream},
     parse_macro_input,
 };
