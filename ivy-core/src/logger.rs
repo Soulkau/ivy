@@ -21,7 +21,8 @@ pub const LOG_QUEUE_SIZE: usize = 16;
 pub type Log = DeviceLog<LOG_SIZE, TAG_SIZE>;
 pub type SizedLogQueue = LogQueue<LOG_QUEUE_SIZE>;
 
-// the consumer just needs a 'static ref into the queue to pop() from
+static LOG_QUEUE: SizedLogQueue = SizedLogQueue::new();
+
 pub type LogSink = &'static SizedLogQueue;
 
 pub trait LogEmitter: Sync + Send {
@@ -76,13 +77,13 @@ impl<const N: usize> LogEmitter for &'static LogQueue<N> {
     }
 }
 
-pub struct Logger<E: LogEmitter> {
+pub struct LogSubscriber<E: LogEmitter> {
     max_level: Level,
     next_id: AtomicU32,
     emitter: E,
 }
 
-impl<E: LogEmitter> Logger<E> {
+impl<E: LogEmitter> LogSubscriber<E> {
     pub fn new(max_level: Level, emitter: E) -> Self {
         Self {
             max_level,
@@ -92,7 +93,7 @@ impl<E: LogEmitter> Logger<E> {
     }
 }
 
-impl<E: LogEmitter + 'static> Subscriber for Logger<E> {
+impl<E: LogEmitter + 'static> Subscriber for LogSubscriber<E> {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
         metadata.level() <= &self.max_level
     }
@@ -168,26 +169,22 @@ impl Visit for BufVisitor {
     }
 }
 
-fn register_dispatcher(level: Level, queue: LogSink) {
-    tracing::dispatcher::set_global_default(Dispatch::new(Logger::new(level, queue))).unwrap();
+pub fn sink() -> LogSink {
+    &LOG_QUEUE
 }
 
-pub fn init_subscriber(level: Level) -> LogSink {
-    static QUEUE: StaticCell<SizedLogQueue> = StaticCell::new();
-    let queue: LogSink = QUEUE.init_with(LogQueue::new);
-    register_dispatcher(level, queue);
-    queue
+pub fn init_logger(level: Level) {
+    tracing::dispatcher::set_global_default(Dispatch::new(LogSubscriber::new(level, sink()))).expect("logger already initialised");
 }
 
 #[macro_export]
-macro_rules! init_logger {
-    ($spawner:expr, $consumer:expr, $sink:expr, $consumer_ty:ty) => {{
+macro_rules! spawn_logger {
+    ($spawner:expr, $consumer:expr, $consumer_ty:ty) => {{
         #[embassy_executor::task]
-        async fn ___logger_task(mut consumer: $consumer_ty, sink: $crate::logger::LogSink) -> ! {
+        async fn ___logger_task(mut consumer: $consumer_ty) -> ! {
             use $crate::logger::LogConsumer;
-            consumer.consume_logs(sink).await
+            consumer.consume_logs($crate::logger::sink()).await
         }
-        //TODO: error handling, do not panic
-        $spawner.spawn(___logger_task($consumer, $sink).expect("Failed to run log task"));
+        $spawner.spawn(___logger_task($consumer).expect("Failed to run log task"));
     }};
 }
