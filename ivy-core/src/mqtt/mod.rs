@@ -185,7 +185,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
 
 impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, const TLS: usize> MqttModule<Rng, S, NET, TCP, TLS> {
     pub fn new(res: MqttResources<Rng, NET, TCP, TLS>, config: MqttConfig, ca: &'static [u8], subscribers: [&'static dyn ErasedSubscription; S]) -> Self {
-        tracing::info!(tag = "mqtt", "creating mqtt module");
+        tracing::debug!(tag = "mqtt", "creating mqtt module");
         static TLS_CONFIG: StaticCell<TlsConfig<'static>> = StaticCell::new();
 
         let tls_config = TLS_CONFIG.init_with(|| TlsConfig::new().enable_rsa_signatures().with_server_name(config.host_name));
@@ -205,7 +205,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
             .password(config.password.as_bytes())
             .username(config.username)
             .build();
-        tracing::info!(tag = "mqtt", "Using host: '{}'", config.host);
+        tracing::debug!(tag = "mqtt", "using host: '{}'", config.host);
         let (mqtt_stack, client) = mqttrust::new(res.mqtt_state, configuration);
 
         let provider = MqttTlsProvider::new(res.rng, ca);
@@ -217,7 +217,7 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
             provider,
         );
 
-        tracing::info!(tag = "mqtt", "created mqtt module");
+        tracing::info!(tag = "mqtt", "initialized mqtt module");
         Self {
             subscribers,
             mqtt_stack,
