@@ -1,3 +1,5 @@
+use core::fmt::Display;
+
 use const_panic::concat_panic;
 use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -5,9 +7,24 @@ use embassy_sync::mutex::Mutex as AsyncMutex;
 use embedded_storage::nor_flash::NorFlash;
 use sequential_storage::cache::NoCache;
 use sequential_storage::map::{MapConfig, MapStorage};
-use serde::{Deserialize, Serialize};
 
+use crate::codecs::{CodecError, Decode, Encode, Postcard};
 use crate::flash::FlashPartition;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError<E: core::fmt::Debug> {
+    /// Flash or sequential-storage failure
+    #[error("flash error: {0:?}")]
+    Flash(#[from] sequential_storage::Error<E>),
+    /// Value didn't fit in the buffer or couldn't be serialized
+    #[error("failed to encode value: {0}")]
+    Encode(CodecError),
+    /// Bytes exist but don't match the type (corrupt, or written by a different version)
+    #[error("failed to decode value: {0}")]
+    Decode(CodecError),
+    #[error("value for key {0} was not found")]
+    NotFound(StorageKey),
+}
 
 pub struct StorageInner<F: NorFlash + 'static> {
     storage: MapStorage<u32, BlockingAsync<FlashPartition<F>>, NoCache>,
@@ -36,19 +53,32 @@ impl<F: NorFlash> FlashStorage<F> {
         Self { inner }
     }
 
-    pub async fn get<D: for<'de> Deserialize<'de>>(&self, key: StorageKey) -> Option<D> {
+    pub async fn get<D>(&self, key: StorageKey) -> Result<D, StorageError<F::Error>>
+    where
+        D: for<'a> Decode<'a, Postcard>,
+    {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
-        let item_data = inner.storage.fetch_item(&mut inner.ser_buf, key.as_ref()).await.ok()??;
-        let data: D = postcard::from_bytes(item_data).ok()?;
-        Some(data)
+
+        let maybe_item = inner.storage.fetch_item(&mut inner.ser_buf, key.as_ref()).await?;
+        let Some(item) = maybe_item else {
+            return Err(StorageError::NotFound(key));
+        };
+
+        <D as Decode<Postcard>>::decode(item).map_err(StorageError::Decode)
     }
 
-    pub async fn set<S: Serialize>(&self, key: StorageKey, value: &S) {
+    pub async fn set<S>(&self, key: StorageKey, value: &S) -> Result<(), StorageError<F::Error>>
+    where
+        S: Encode<Postcard>,
+    {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
-        let serialized: &[u8] = postcard::to_slice(value, &mut inner.ser_buf).unwrap();
-        let _ = inner.storage.store_item(&mut inner.work_buf, &key.as_ref(), &serialized).await;
+
+        let len = <S as Encode<Postcard>>::encode(value, &mut inner.ser_buf).map_err(StorageError::Encode)?;
+        let serialized: &[u8] = &inner.ser_buf[..len];
+        inner.storage.store_item(&mut inner.work_buf, key.as_ref(), &serialized).await?;
+        Ok(())
     }
 }
 
@@ -61,7 +91,14 @@ macro_rules! init_storage {
     }};
 }
 
+#[derive(Debug)]
 pub struct StorageKey(pub(crate) u32);
+
+impl Display for StorageKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 pub const MIN_KEY_VALUE: u32 = 100;
 
