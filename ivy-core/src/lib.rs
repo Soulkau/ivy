@@ -4,7 +4,6 @@
 #![allow(incomplete_features)]
 
 pub mod codecs;
-pub mod device;
 pub mod flash;
 pub mod logger;
 pub mod mqtt;
