@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 // Add variants if they are useful for controlflow
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
-    #[error("codec output buffer is full")]
+    #[error("output buffer is full")]
     BufferFull,
-
+    /// This is used for logging any errors that happen and do not belong to useful errors
     #[error("{0}")]
     Displayed(heapless::String<128>),
 }
