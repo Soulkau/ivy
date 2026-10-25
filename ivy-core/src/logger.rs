@@ -1,12 +1,11 @@
 use core::cell::RefCell;
-use core::fmt::Write;
+use core::fmt::{Debug, Write};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use heapless::{Deque, String};
-use static_cell::StaticCell;
 use talky::logs::{DeviceLog, LogLevel};
 use tracing::{
     Dispatch, Level, Subscriber,
@@ -187,4 +186,34 @@ macro_rules! spawn_logger {
         }
         $spawner.spawn(___logger_task($consumer).expect("Failed to run log task"));
     }};
+}
+
+pub trait ResultExt<T> {
+    /// Logs the error (if any) and turns the result into an `Option`.
+    fn ok_logged(self, tag: &'static str) -> Option<T>;
+
+    /// Same, but with a short context message.
+    fn ok_logged_ctx(self, tag: &'static str, ctx: &str) -> Option<T>;
+}
+
+impl<T, E: Debug> ResultExt<T> for Result<T, E> {
+    fn ok_logged(self, tag: &'static str) -> Option<T> {
+        match self {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!(tag = tag, "{e:?}");
+                None
+            }
+        }
+    }
+
+    fn ok_logged_ctx(self, tag: &'static str, ctx: &str) -> Option<T> {
+        match self {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!(tag, "{ctx}: {e:?}");
+                None
+            }
+        }
+    }
 }
