@@ -22,8 +22,6 @@ pub enum StorageError<E: core::fmt::Debug> {
     /// Bytes exist but don't match the type (corrupt, or written by a different version)
     #[error("failed to decode value: {0}")]
     Decode(CodecError),
-    #[error("value for key {0} was not found")]
-    NotFound(StorageKey),
 }
 
 pub struct StorageInner<F: NorFlash + 'static> {
@@ -53,19 +51,20 @@ impl<F: NorFlash> FlashStorage<F> {
         Self { inner }
     }
 
-    pub async fn get<D>(&self, key: StorageKey) -> Result<D, StorageError<F::Error>>
+    pub async fn get<D>(&self, key: StorageKey) -> Result<Option<D>, StorageError<F::Error>>
     where
         D: for<'a> Decode<'a, Postcard>,
     {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
 
-        let maybe_item = inner.storage.fetch_item(&mut inner.ser_buf, key.as_ref()).await?;
-        let Some(item) = maybe_item else {
-            return Err(StorageError::NotFound(key));
+        let maybe_bytes = inner.storage.fetch_item(&mut inner.ser_buf, key.as_ref()).await?;
+        let Some(bytes) = maybe_bytes else {
+            return Ok(None);
         };
 
-        <D as Decode<Postcard>>::decode(item).map_err(StorageError::Decode)
+        let value = <D as Decode<Postcard>>::decode(bytes).map_err(StorageError::Decode)?;
+        Ok(Some(value))
     }
 
     pub async fn set<S>(&self, key: StorageKey, value: &S) -> Result<(), StorageError<F::Error>>
