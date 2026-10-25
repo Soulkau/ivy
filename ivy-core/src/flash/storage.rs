@@ -84,9 +84,9 @@ impl<F: NorFlash> FlashStorage<F> {
 #[macro_export]
 macro_rules! init_storage {
     ($flash_ty:ty, $partition:expr) => {{
-        static CELL: static_cell::StaticCell<$crate::flash::Inner<$flash_ty>> = static_cell::StaticCell::new();
-        let storage_ref = CELL.init_with(|| $crate::flash::FlashStorage::<$flash_ty>::build($partition));
-        $crate::flash::FlashStorage::from_static(storage_ref)
+        static CELL: static_cell::StaticCell<$crate::flash::storage::Inner<$flash_ty>> = static_cell::StaticCell::new();
+        let storage_ref = CELL.init_with(|| $crate::flash::storage::FlashStorage::<$flash_ty>::build($partition));
+        $crate::flash::storage::FlashStorage::from_static(storage_ref)
     }};
 }
 
