@@ -68,7 +68,7 @@ pub const MIN_KEY_VALUE: u32 = 100;
 impl StorageKey {
     pub const fn new(key: u32) -> Self {
         if key < MIN_KEY_VALUE {
-            concat_panic!("This ket is reserved for system use: ", key);
+            concat_panic!("This key is reserved for system use: ", key);
         }
         Self(key)
     }
