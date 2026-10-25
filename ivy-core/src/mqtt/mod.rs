@@ -22,7 +22,7 @@ use embassy_net::{
     tcp::client::{TcpClient, TcpClientState},
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_tls::{CryptoRngCore, TlsConfig};
 use ivy_macros::actor_handle;
 use ivy_types::actor::{Actor, rt::launder_slice};
@@ -231,12 +231,11 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
     async fn run_stack_task(mqtt_stack: &mut MqttStack<'static, CriticalSectionRawMutex>, transport: &mut MqttTlsTransport<Rng, TCP, TLS>, network_stack: Stack<'static>) -> ! {
         loop {
             network_stack.wait_config_up().await;
-            mqtt_stack.run(transport).await;
-            Timer::after(Duration::from_millis(4000)).await;
-            // All following is done internally in run of mqtt_stack, but just to make sure
-            mqtt_stack.disconnect(transport).await.ok();
+            select(mqtt_stack.run(transport), network_stack.wait_config_down()).await;
+            // socket is dead here, so in case any goodbyes hang
+            with_timeout(Duration::from_secs(2), mqtt_stack.disconnect(transport)).await.ok();
             mqtt_stack.reset().await;
-            tracing::warn!(tag = "mqtt", "connection lost, reconnecting...");
+            Timer::after(Duration::from_millis(4000)).await;
         }
     }
 
@@ -302,7 +301,10 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
         }
     }
 
-    /// Manages subscriptions
+    /// Manages subscriptions.
+    ///
+    /// Subscribes to all topics (retrying with backoff), then dispatches incoming
+    /// messages. If the subscription closes, it waits a moment and subscribes again.
     async fn handle_subscriptions(subscribers: &[&'static dyn ErasedSubscription; S], client: &MqttClient<'static, CriticalSectionRawMutex>) -> ! {
         let topics: &[SubscribeTopic<'static>] = &subscribers.map(|sub| sub.topic().into());
 
@@ -320,36 +322,28 @@ impl<Rng: CryptoRngCore, const S: usize, const NET: usize, const TCP: usize, con
                         break sub;
                     }
                     Err(e) => {
-                        tracing::error!(tag = "mqtt", "subscribe failed: {:?}. retrying in {}ms...", e, back_off_ms);
-
+                        tracing::error!(tag = "mqtt", "subscribe failed: {:?}, retrying in {}ms ", e, back_off_ms);
                         Timer::after(Duration::from_millis(back_off_ms)).await;
                         back_off_ms = (back_off_ms * 3 / 2).min(20000);
                     }
                 }
             };
 
-            loop {
-                match subscription.next_message().await {
-                    Some(msg) => {
-                        let Some(subscriber) = subscribers.iter().find(|sub| sub.topic() == msg.topic_name()) else {
-                            tracing::warn!(tag = "mqtt", "no handle found for topic {}", msg.topic_name());
-                            continue;
-                        };
+            // `None` means the subscription is closed
+            while let Some(msg) = subscription.next_message().await {
+                let Some(subscriber) = subscribers.iter().find(|sub| sub.topic() == msg.topic_name()) else {
+                    tracing::warn!(tag = "mqtt", "no handle found for topic {}", msg.topic_name());
+                    continue;
+                };
 
-                        match subscriber.dispatch(msg.payload()) {
-                            Ok(()) => {
-                                tracing::debug!(tag = "mqtt", "dispatched message for topic {}", msg.topic_name());
-                            }
-                            Err(e) => {
-                                tracing::error!(tag = "mqtt", "failed to dispatch message for topic {}: {}", msg.topic_name(), e);
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::error!(tag = "mqtt", "received none message in sub task");
-                    }
+                match subscriber.dispatch(msg.payload()) {
+                    Ok(()) => tracing::debug!(tag = "mqtt", "dispatched message for topic {}", msg.topic_name()),
+                    Err(e) => tracing::error!(tag = "mqtt", "failed to dispatch message for topic {}: {}", msg.topic_name(), e),
                 }
             }
+
+            tracing::warn!(tag = "mqtt", "subscription closed, resubscribing shortly");
+            Timer::after(Duration::from_millis(500)).await;
         }
     }
 }
