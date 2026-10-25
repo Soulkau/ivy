@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use static_cell::StaticCell;
 use talky::{device::DeviceType, id::DeviceID};
 
-use crate::flash::{FlashStorage, StorageKey};
+use crate::flash::storage::{FlashStorage, StorageKey};
 
 #[derive(Serialize, Deserialize)]
 pub struct PersistentDeviceMeta {
