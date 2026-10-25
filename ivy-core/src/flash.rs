@@ -14,28 +14,28 @@ type SynchronizedFlash<F> = BlockingMutex<CriticalSectionRawMutex, RefCell<F>>;
 
 /// Holds synchronized flash, used to create partitions.
 /// All partitions share the same physical flash and are access-serialized.
-pub struct IvyFlash<F: NorFlash + 'static> {
+pub struct Flash<F: NorFlash + 'static> {
     flash: &'static SynchronizedFlash<F>,
 }
 
-impl<F: NorFlash> IvyFlash<F> {
+impl<F: NorFlash> Flash<F> {
     pub fn new(flash: &'static SynchronizedFlash<F>) -> Self {
         Self { flash }
     }
     /// Creates new partition
-    pub fn partition(&self, range: Range<u32>) -> IvyFlashPartition<F> {
-        IvyFlashPartition::new(self.flash, range)
+    pub fn partition(&self, range: Range<u32>) -> FlashPartition<F> {
+        FlashPartition::new(self.flash, range)
     }
 }
 
 /// A region of flash defined by `range`, addressed relative to itself (0..size),
 /// not the chip's absolute position. Bounds are NOT checked.
-pub struct IvyFlashPartition<F: NorFlash + 'static> {
+pub struct FlashPartition<F: NorFlash + 'static> {
     flash: &'static SynchronizedFlash<F>,
     range: Range<u32>, // start = offset, end = offset + size
 }
 
-impl<F: NorFlash> IvyFlashPartition<F> {
+impl<F: NorFlash> FlashPartition<F> {
     pub const fn new(flash: &'static SynchronizedFlash<F>, range: Range<u32>) -> Self {
         Self { flash, range }
     }
@@ -49,11 +49,11 @@ impl<F: NorFlash> IvyFlashPartition<F> {
     }
 }
 
-impl<F: NorFlash> ErrorType for IvyFlashPartition<F> {
+impl<F: NorFlash> ErrorType for FlashPartition<F> {
     type Error = F::Error;
 }
 
-impl<F: NorFlash> ReadNorFlash for IvyFlashPartition<F> {
+impl<F: NorFlash> ReadNorFlash for FlashPartition<F> {
     const READ_SIZE: usize = F::READ_SIZE;
 
     fn read(&mut self, off: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -66,7 +66,7 @@ impl<F: NorFlash> ReadNorFlash for IvyFlashPartition<F> {
     }
 }
 
-impl<F: NorFlash> NorFlash for IvyFlashPartition<F> {
+impl<F: NorFlash> NorFlash for FlashPartition<F> {
     const WRITE_SIZE: usize = F::WRITE_SIZE;
     const ERASE_SIZE: usize = F::ERASE_SIZE;
 
@@ -87,12 +87,12 @@ macro_rules! init_flash {
         static CELL: static_cell::StaticCell<embassy_sync::blocking_mutex::Mutex<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, core::cell::RefCell<$flash_ty>>> =
             static_cell::StaticCell::new();
         let flash_ref = CELL.init_with(|| embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new($flash)));
-        $crate::flash::IvyFlash::<$flash_ty>::new(flash_ref)
+        $crate::flash::Flash::<$flash_ty>::new(flash_ref)
     }};
 }
 
 pub struct StorageInner<F: NorFlash + 'static> {
-    storage: MapStorage<u32, BlockingAsync<IvyFlashPartition<F>>, NoCache>,
+    storage: MapStorage<u32, BlockingAsync<FlashPartition<F>>, NoCache>,
     ser_buf: [u8; 256],
     work_buf: [u8; 256],
 }
@@ -105,7 +105,7 @@ pub struct FlashStorage<F: NorFlash + 'static> {
 
 impl<F: NorFlash> FlashStorage<F> {
     #[doc(hidden)]
-    pub fn build(partition: IvyFlashPartition<F>) -> Inner<F> {
+    pub fn build(partition: FlashPartition<F>) -> Inner<F> {
         let map_config = MapConfig::new(0..partition.size()); // relative, not absolute
         AsyncMutex::new(StorageInner {
             storage: MapStorage::new(BlockingAsync::new(partition), map_config, NoCache::new()),
