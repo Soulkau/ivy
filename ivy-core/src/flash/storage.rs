@@ -24,6 +24,7 @@ pub enum StorageError<E: core::fmt::Debug> {
     Decode(CodecError),
 }
 
+//TODO: Make storage buffer sizes as const params
 pub struct StorageInner<F: NorFlash + 'static> {
     storage: MapStorage<u32, BlockingAsync<FlashPartition<F>>, NoCache>,
     ser_buf: [u8; 256],
@@ -67,14 +68,10 @@ impl<F: NorFlash> FlashStorage<F> {
         Ok(Some(value))
     }
 
-    pub async fn set<S>(&self, key: StorageKey, value: &S) -> Result<(), StorageError<F::Error>>
-    where
-        S: Encode<Postcard>,
-    {
+    pub async fn set(&self, key: StorageKey, value: &impl Encode<Postcard>) -> Result<(), StorageError<F::Error>> {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
-
-        let len = <S as Encode<Postcard>>::encode(value, &mut inner.ser_buf).map_err(StorageError::Encode)?;
+        let len = value.encode(&mut inner.ser_buf).map_err(StorageError::Encode)?;
         let serialized: &[u8] = &inner.ser_buf[..len];
         inner.storage.store_item(&mut inner.work_buf, key.as_ref(), &serialized).await?;
         Ok(())
