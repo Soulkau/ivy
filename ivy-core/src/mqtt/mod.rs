@@ -41,6 +41,7 @@ use crate::{
 };
 
 pub mod cert;
+pub mod ota;
 pub mod subscription;
 
 // Aliases for a TCP client state with 1 connection slot for mqtt.
