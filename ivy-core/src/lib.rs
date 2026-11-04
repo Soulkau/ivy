@@ -7,6 +7,7 @@ pub mod codecs;
 pub mod flash;
 pub mod logger;
 pub mod mqtt;
+pub mod ota;
 pub mod wifi;
 
 extern crate alloc;
