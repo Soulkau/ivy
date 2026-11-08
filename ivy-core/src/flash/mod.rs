@@ -43,6 +43,10 @@ impl<F: NorFlash> FlashPartition<F> {
     fn size(&self) -> u32 {
         self.range.end - self.range.start
     }
+
+    pub fn wipe(&mut self) -> Result<(), F::Error> {
+        self.erase(0, self.size())
+    }
 }
 
 impl<F: NorFlash> ErrorType for FlashPartition<F> {
