@@ -1,14 +1,41 @@
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+use heapless::Vec;
+use upit::UpdateRequest;
 
 use crate::{
-    codecs::{Decode, Postcard},
-    mqtt::subscription::{ErasedSubscription, Subscription},
-    ota::{OtaChunk, OtaHandle, OtaUpdateRequest},
+    codecs::CodecError,
+    mqtt::{
+        RawMqttHandle,
+        subscription::{ErasedSubscription, Subscription},
+    },
+    ota::{
+        OtaChunk, OtaHandle,
+        client::{OtaClient, OtaTransport},
+    },
 };
 
+const REPLY_TOPIC: &str = "ota/reply";
+const CALLBACK_TOPIC: &str = "ota/callbacks";
+
+#[derive(Clone, Copy)]
 pub struct ChunkStreamSubscription<const C: usize> {
     channel: &'static Channel<CriticalSectionRawMutex, OtaChunk<C>, 4>,
     chunk_topic: &'static str,
+}
+
+impl<const C: usize> ChunkStreamSubscription<C> {
+    pub fn new(chunk_topic: &'static str, channel: &'static Channel<CriticalSectionRawMutex, OtaChunk<C>, 4>) -> Self {
+        Self { channel, chunk_topic }
+    }
+
+    pub async fn next_chunk(&self) -> OtaChunk<C> {
+        self.channel.receive().await
+    }
+
+    /// Throw away anything queued. Leftovers belong to a dead session.
+    pub fn drain(&self) {
+        while self.channel.try_receive().is_ok() {}
+    }
 }
 
 impl<const C: usize> ErasedSubscription for ChunkStreamSubscription<C> {
@@ -16,23 +43,53 @@ impl<const C: usize> ErasedSubscription for ChunkStreamSubscription<C> {
         self.chunk_topic
     }
 
-    fn dispatch(&self, buf: &[u8]) -> Result<(), crate::codecs::CodecError> {
-        let chunk = <OtaChunk<C> as Decode<Postcard>>::decode(buf)?;
-        self.channel.try_send(chunk).ok();
+    fn dispatch(&self, buf: &[u8]) -> Result<(), CodecError> {
+        // Keep the packet raw. The actor decodes it as an UpdateChunk and borrows from this buffer.
+        let Ok(data) = Vec::from_slice(buf) else {
+            tracing::warn!(tag = "mqtt/ota", "chunk packet bigger than C, dropped");
+            return Ok(());
+        };
+        if self.channel.try_send(OtaChunk { data }).is_err() {
+            tracing::warn!(tag = "mqtt/ota", "chunk channel full, chunk dropped");
+        }
         Ok(())
     }
 }
 
-pub async fn ota_mqtt_task<const C: usize>(handle: OtaHandle<C>, request: Subscription<OtaUpdateRequest>, chunks: ChunkStreamSubscription<C>) -> ! {
-    loop {
-        let request = request.next().await;
-        let go_on = handle.ask(request).await;
-        if !go_on {
-            continue;
-        }
+pub struct MqttOta<const C: usize> {
+    request: Subscription<UpdateRequest>,
+    chunks: ChunkStreamSubscription<C>,
+    mqtt: RawMqttHandle,
+}
 
-        while !handle.pass_chunk(chunks.channel.receive().await).await {
-            // Do something meanwhile it is not finished idk
+impl<const C: usize> OtaTransport<C> for MqttOta<C> {
+    async fn next_request(&mut self) -> UpdateRequest {
+        let request = self.request.next().await;
+        tracing::info!(tag = "mqtt/ota", "got the update request");
+        // The CLI sends chunks only after our reply, so anything queued now is stale.
+        self.chunks.drain();
+        request
+    }
+
+    async fn next_chunk(&mut self) -> OtaChunk<C> {
+        self.chunks.next_chunk().await
+    }
+
+    async fn send_reply(&mut self, bytes: &[u8]) {
+        unsafe {
+            self.mqtt.publish(REPLY_TOPIC, bytes).await;
         }
     }
+
+    async fn send_callback(&mut self, bytes: &[u8]) {
+        unsafe {
+            self.mqtt.publish(CALLBACK_TOPIC, bytes).await;
+        }
+    }
+}
+
+pub async fn ota_mqtt_task<const C: usize>(handle: OtaHandle<C>, request: Subscription<UpdateRequest>, chunks: ChunkStreamSubscription<C>, mqtt_handle: RawMqttHandle) -> ! {
+    let client = OtaClient::new(handle);
+    let mut transport = MqttOta { request, chunks, mqtt: mqtt_handle };
+    client.run(&mut transport).await
 }
