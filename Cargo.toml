@@ -10,6 +10,7 @@ exclude = [
     "templates"
 ]
 [workspace.dependencies]
+upit = {path = "../upit", features = ["flash"]}
 talky = { git = "https://github.com/Soulkau/Talky", rev = "dc0a09c" }
 
 # Main

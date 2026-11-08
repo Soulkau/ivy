@@ -7,6 +7,7 @@ edition = "2024"
 ivy-types = {path="../ivy-types"}
 ivy-macros = {path="../ivy-macros"}
 
+upit.workspace = true
 talky.workspace = true
 heapless.workspace = true
 embassy-executor.workspace = true
