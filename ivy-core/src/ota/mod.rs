@@ -6,7 +6,7 @@ use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use heapless::Vec;
 use ivy_macros::actor_handle;
 use ivy_types::actor::Actor;
-use upit::{DeviceSpecs, OtaReply, UpdateChunk, UpdateError, UpdateRequest, UpdateResponse, UpitProtocol, flash::UpdateWriter};
+use upit::{DeviceSpecs, OtaReply, UpdateChunk, UpdateError, UpdateRequest, UpdateResponse, UpitProtocol, flash::UpdateWriter, protocols::offset::OffsetProtocolV1};
 
 use crate::flash::FlashPartition;
 
@@ -55,7 +55,7 @@ pub enum OtaState<P: UpitProtocol> {
     Rebooting,
 }
 
-pub struct OtaModule<const C: usize, UP, F, P>
+pub struct OtaModule<const C: usize, F, P, UP = OffsetProtocolV1>
 where
     UP: UpitProtocol,
     F: NorFlash + 'static,
@@ -67,7 +67,7 @@ where
     platform: P,
 }
 
-impl<const C: usize, UP, F, P> OtaModule<C, UP, F, P>
+impl<const C: usize, F, P, UP> OtaModule<C, F, P, UP>
 where
     UP: UpitProtocol,
     F: NorFlash + 'static,
@@ -171,7 +171,7 @@ where
     }
 }
 
-impl<const C: usize, UP, F, P> Actor for OtaModule<C, UP, F, P>
+impl<const C: usize, F, P, UP> Actor for OtaModule<C, F, P, UP>
 where
     UP: UpitProtocol,
     F: NorFlash + 'static,
