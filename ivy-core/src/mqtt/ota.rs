@@ -3,7 +3,7 @@ use heapless::Vec;
 use upit::UpdateRequest;
 
 use crate::{
-    codecs::CodecError,
+    codecs::{CodecError, Postcard},
     mqtt::{
         RawMqttHandle,
         subscription::{ErasedSubscription, Subscription},
@@ -32,7 +32,6 @@ impl<const C: usize> ChunkStreamSubscription<C> {
         self.channel.receive().await
     }
 
-    /// Throw away anything queued. Leftovers belong to a dead session.
     pub fn drain(&self) {
         while self.channel.try_receive().is_ok() {}
     }
@@ -44,7 +43,6 @@ impl<const C: usize> ErasedSubscription for ChunkStreamSubscription<C> {
     }
 
     fn dispatch(&self, buf: &[u8]) -> Result<(), CodecError> {
-        // Keep the packet raw. The actor decodes it as an UpdateChunk and borrows from this buffer.
         let Ok(data) = Vec::from_slice(buf) else {
             tracing::warn!(tag = "mqtt/ota", "chunk packet bigger than C, dropped");
             return Ok(());
@@ -57,7 +55,7 @@ impl<const C: usize> ErasedSubscription for ChunkStreamSubscription<C> {
 }
 
 pub struct MqttOta<const C: usize> {
-    request: Subscription<UpdateRequest>,
+    request: Subscription<UpdateRequest, Postcard>,
     chunks: ChunkStreamSubscription<C>,
     mqtt: RawMqttHandle,
 }
@@ -88,7 +86,7 @@ impl<const C: usize> OtaTransport<C> for MqttOta<C> {
     }
 }
 
-pub async fn ota_mqtt_task<const C: usize>(handle: OtaHandle<C>, request: Subscription<UpdateRequest>, chunks: ChunkStreamSubscription<C>, mqtt_handle: RawMqttHandle) -> ! {
+pub async fn ota_mqtt_task<const C: usize>(handle: OtaHandle<C>, request: Subscription<UpdateRequest, Postcard>, chunks: ChunkStreamSubscription<C>, mqtt_handle: RawMqttHandle) -> ! {
     let client = OtaClient::new(handle);
     let mut transport = MqttOta { request, chunks, mqtt: mqtt_handle };
     client.run(&mut transport).await
