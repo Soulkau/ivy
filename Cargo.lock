@@ -1314,7 +1314,7 @@ dependencies = [
 [[package]]
 name = "mqttrust"
 version = "1.0.0"
-source = "git+https://github.com/Soulkau/mqttrust.git#68e95d9365c8961a94cc981df2f24c1bab7b95f7"
+source = "git+https://github.com/Soulkau/mqttrust.git#bece68afc32e7628c022ecc22793b5335444d316"
 dependencies = [
  "bon",
  "embassy-futures",
