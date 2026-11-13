@@ -39,7 +39,7 @@ impl<F: NorFlash> FlashPartition<F> {
     fn offset(&self) -> u32 {
         self.range.start
     }
-    /// Parition size in butes
+    /// Parition size in bytes
     fn size(&self) -> u32 {
         self.range.end - self.range.start
     }
