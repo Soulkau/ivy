@@ -1,7 +1,8 @@
 use core::marker::PhantomData;
 
 use alloc::borrow::Cow;
-use embassy_time::{Duration, Timer};
+use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
 use heapless::Vec;
 use ivy_macros::actor_handle;
@@ -17,6 +18,8 @@ const CHUNK_ENVELOPE: usize = 3;
 /// How long to wait before rebooting, so the transport can publish the final reply.
 const REBOOT_GRACE: Duration = Duration::from_millis(500);
 
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One raw packet from the transport. Only the module decodes it.
 pub struct OtaChunk<const S: usize> {
     pub data: Vec<u8, S>,
@@ -24,34 +27,30 @@ pub struct OtaChunk<const S: usize> {
 
 pub type OtaBytes = Vec<u8, 64>;
 
-/// What `pass_chunk` gives back.
-pub enum OtaResult {
-    /// Chunk written, nothing to say.
-    Continue,
-    /// Protocol message in the middle of an update. Session stays open.
-    Callback(OtaBytes),
-    /// Update is over (done or failed). Send it and stop listening for chunks.
-    End(OtaBytes),
+pub enum OtaEvent<const C: usize> {
+    Request(UpdateRequest),
+    Chunk(OtaChunk<C>),
 }
 
-/// What `ask` gives back.
-pub enum OtaAnswer {
-    /// Send it, then start listening for chunks.
-    Accepted(OtaBytes),
-    /// Send it, then go back to waiting for requests.
-    Rejected(OtaBytes),
+pub enum OtaResult {
+    RequestResult(OtaBytes),
+    Callback(OtaBytes),
+    Nothing,
 }
 
 #[actor_handle(OtaHandle)]
 pub trait OtaHandle<const C: usize> {
-    async fn ask(&self, request: UpdateRequest) -> OtaAnswer;
-    async fn pass_chunk(&self, chunk: OtaChunk<C>) -> OtaResult;
+    async fn event(&self, event: OtaEvent<C>) -> OtaResult;
     async fn abort(&self);
 }
 
 pub enum OtaState<P: UpitProtocol> {
     Idle,
-    Progress { writer: UpdateWriter<P>, request: UpdateRequest },
+    Progress {
+        writer: UpdateWriter<P>,
+        request: UpdateRequest,
+        last_activity: Instant,
+    },
     Rebooting,
 }
 
@@ -109,6 +108,7 @@ where
         self.state = OtaState::Progress {
             writer: UpdateWriter::new(assembler),
             request: req,
+            last_activity: Instant::now(),
         };
 
         Ok(UpdateResponse {
@@ -118,7 +118,7 @@ where
         })
     }
 
-    fn begin(&mut self, req: UpdateRequest) -> OtaAnswer {
+    fn begin(&mut self, req: UpdateRequest) -> OtaResult {
         let mut hdr_buf = [0u8; 32]; // protocol headers, msg borrows from this
         let mut out_buf = [0u8; 64]; // the encoded reply
 
@@ -126,48 +126,49 @@ where
             Ok(r) => OtaReply::Accepted(r),
             Err(e) => OtaReply::Rejected(e),
         };
-        let accepted = matches!(msg, OtaReply::Accepted(_));
 
         let Ok(used) = postcard::to_slice(&msg, &mut out_buf) else {
             self.state = OtaState::Idle; // try_begin already wiped and set Progress
-            return OtaAnswer::Rejected(Vec::new()); //TODO: Return error instead of empty vec
+            return OtaResult::RequestResult(Vec::new()); //TODO: Return error instead of empty vec
         };
         let bytes = OtaBytes::from_slice(used).unwrap(); // out_buf is the same size as OtaBytes, can't fail
 
-        if accepted { OtaAnswer::Accepted(bytes) } else { OtaAnswer::Rejected(bytes) }
+        OtaResult::RequestResult(bytes)
     }
 
-    fn on_chunk(&mut self, raw: OtaChunk<C>) -> OtaResult {
-        let OtaState::Progress { writer, request } = &mut self.state else {
-            return OtaResult::End(Vec::new()); // TODO: NoSession bytes
+    //TODO: refactor the last chunks detection logic
+    fn handle_chunk(&mut self, raw: OtaChunk<C>) -> OtaResult {
+        let OtaState::Progress { writer, request, last_activity } = &mut self.state else {
+            return OtaResult::Callback(Vec::new()); // TODO: NoSession bytes
         };
+
+        *last_activity = Instant::now();
         let size = request.size;
 
         let Ok(chunk) = postcard::from_bytes::<UpdateChunk>(&raw.data) else {
-            return OtaResult::Continue; // garbage, the idle timeout catches a dead sender
+            return OtaResult::Nothing;
         };
 
         let Ok(write_result) = writer.write(&mut self.partition, &chunk) else {
-            self.state = OtaState::Idle; // flash error, session is dead
-            return OtaResult::End(Vec::new()); // TODO: Flash error bytes
+            self.state = OtaState::Idle;
+            return OtaResult::Callback(Vec::new()); // TODO: Flash error bytes
         };
 
-        // None means the assembler refused the chunk and nothing was written
         let Some(end) = write_result else {
-            return OtaResult::Continue;
+            return OtaResult::Nothing;
         };
 
         if end == size {
             // TODO: verify hash against request.crc before this
             if self.platform.set_boot_target().is_err() {
                 self.state = OtaState::Idle;
-                return OtaResult::End(Vec::new()); // TODO: Platform error bytes
+                return OtaResult::Callback(Vec::new()); // TODO: Platform error bytes
             }
             self.state = OtaState::Rebooting;
-            return OtaResult::End(Vec::new()); // TODO: success bytes
+            return OtaResult::Callback(Vec::new()); // TODO: success bytes
         }
 
-        OtaResult::Continue // TODO: assembler callback -> OtaResult::Callback(bytes)
+        OtaResult::Nothing // TODO: assembler callback -> OtaResult::Callback(bytes)
     }
 }
 
@@ -182,18 +183,33 @@ where
 
     async fn act(&mut self, mut inbox: ivy_types::actor::Inbox<<Self::Handle as ivy_types::actor::ActorHandle>::Cmd>) -> ! {
         loop {
-            match inbox.next().await {
-                OtaHandleCommand::Ask(c, req) => c.reply(self.begin(req)).await,
-                OtaHandleCommand::PassChunk(c, chunk) => {
-                    c.reply(self.on_chunk(chunk)).await;
-                    if matches!(self.state, OtaState::Rebooting) {
-                        Timer::after(REBOOT_GRACE).await; // let the transport publish the final reply
-                        self.platform.reboot();
-                    }
+            let deadline = match self.state {
+                OtaState::Progress { last_activity, .. } => last_activity + IDLE_TIMEOUT,
+                _ => Instant::MAX,
+            };
+
+            let cmd = match select(inbox.next(), Timer::at(deadline)).await {
+                Either::First(cmd) => cmd,
+                Either::Second(_) => {
+                    tracing::warn!(tag = "ota", "idle timeout, dropping session");
+                    self.state = OtaState::Idle;
+                    continue;
+                }
+            };
+
+            match cmd {
+                OtaHandleCommand::Event(c, event) => {
+                    let reply = match event {
+                        OtaEvent::Chunk(chunk) => self.handle_chunk(chunk),
+                        OtaEvent::Request(request) => self.begin(request),
+                    };
+
+                    c.reply(reply).await;
                 }
                 OtaHandleCommand::Abort(c) => {
+                    //TODO: implement aborting
                     self.state = OtaState::Idle;
-                    c.reply(()).await
+                    c.ack().await;
                 }
             }
         }

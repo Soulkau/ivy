@@ -1,3 +1,4 @@
+use embassy_futures::select::{Either, select};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use heapless::Vec;
 use upit::UpdateRequest;
@@ -9,7 +10,7 @@ use crate::{
         subscription::{ErasedSubscription, Subscription},
     },
     ota::{
-        OtaChunk, OtaHandle,
+        OtaChunk, OtaEvent, OtaHandle,
         client::{OtaClient, OtaTransport},
     },
 };
@@ -61,16 +62,11 @@ pub struct MqttOta<const C: usize> {
 }
 
 impl<const C: usize> OtaTransport<C> for MqttOta<C> {
-    async fn next_request(&mut self) -> UpdateRequest {
-        let request = self.request.next().await;
-        tracing::info!(tag = "mqtt/ota", "got the update request");
-        // The CLI sends chunks only after our reply, so anything queued now is stale.
-        self.chunks.drain();
-        request
-    }
-
-    async fn next_chunk(&mut self) -> OtaChunk<C> {
-        self.chunks.next_chunk().await
+    async fn next_event(&mut self) -> crate::ota::OtaEvent<C> {
+        match select(self.request.next(), self.chunks.next_chunk()).await {
+            Either::First(request) => OtaEvent::Request(request),
+            Either::Second(chunk) => OtaEvent::Chunk(chunk),
+        }
     }
 
     async fn send_reply(&mut self, bytes: &[u8]) {
