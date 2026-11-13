@@ -61,6 +61,7 @@ pub struct MqttOta<const C: usize> {
     mqtt: RawMqttHandle,
 }
 
+//TODO: handle mqtt errors
 impl<const C: usize> OtaTransport<C> for MqttOta<C> {
     async fn next_event(&mut self) -> crate::ota::OtaEvent<C> {
         match select(self.request.next(), self.chunks.next_chunk()).await {

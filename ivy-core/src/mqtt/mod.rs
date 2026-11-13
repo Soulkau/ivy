@@ -41,7 +41,6 @@ use crate::{
 };
 
 pub mod cert;
-pub mod ota;
 pub mod subscription;
 
 // Aliases for a TCP client state with 1 connection slot for mqtt.
@@ -79,7 +78,7 @@ impl RawMqttHandle {
     /// `payload` must stay valid until the actor finishes reading it (before it replies) -
     ///  this function (as all other actor_handle generated functions) are cancel-unsafe,
     ///  using anything that will drop future before its compeletion will result in panic.
-    async unsafe fn publish(&self, topic: &'static str, payload: &[u8]) -> Result<(), MqttError> {
+    pub async unsafe fn publish(&self, topic: &'static str, payload: &[u8]) -> Result<(), MqttError> {
         self.__publish(topic, unsafe { launder_slice(payload) }).await
     }
 }

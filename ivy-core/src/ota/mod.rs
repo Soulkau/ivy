@@ -12,11 +12,10 @@ use upit::{DeviceSpecs, OtaReply, UpdateChunk, UpdateError, UpdateRequest, Updat
 use crate::flash::FlashPartition;
 
 pub mod client;
+pub mod mqtt;
 
 /// The wire adds a length prefix to every chunk, so not all of C is data.
 const CHUNK_ENVELOPE: usize = 3;
-/// How long to wait before rebooting, so the transport can publish the final reply.
-const REBOOT_GRACE: Duration = Duration::from_millis(500);
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -54,6 +53,7 @@ pub enum OtaState<P: UpitProtocol> {
     Rebooting,
 }
 
+//TODO: reboot after update is complete
 pub struct OtaModule<const C: usize, F, P, UP = OffsetProtocolV1>
 where
     UP: UpitProtocol,
@@ -216,6 +216,7 @@ where
     }
 }
 
+//TODO: Finish platform implementation
 pub trait OtaPlatform {
     fn set_boot_target(&mut self) -> Result<(), ()>;
     fn reboot(&mut self) -> !;
