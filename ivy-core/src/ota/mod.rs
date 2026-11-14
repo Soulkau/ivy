@@ -185,11 +185,21 @@ where
 
         if end == size {
             tracing::info!(tag = "ota", "all {} bytes received", size);
+
+            let (matches, hash) = writer.verify(&mut self.partition, &request).unwrap();
+
+            if !matches {
+                tracing::info!(tag = "ota", "update hashes mismatch, request {} written {}", request.hash, hash);
+                return OtaResult::Nothing;
+            }
+
+            tracing::info!("hashes match. written {} request {}", hash, request.hash);
+
             // TODO: verify hash against request.crc before this
             if self.platform.set_boot_target().is_err() {
                 tracing::error!(tag = "ota", "failed to set boot target, dropping session");
                 self.state = OtaState::Idle;
-                return OtaResult::Callback(Vec::new()); // TODO: Platform error bytes
+                return OtaResult::Nothing; // TODO: Platform error bytes
             }
             tracing::info!(tag = "ota", "boot target set, update complete, ready to reboot");
             self.state = OtaState::Rebooting;
