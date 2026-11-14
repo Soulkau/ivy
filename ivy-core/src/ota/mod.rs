@@ -152,8 +152,7 @@ where
 
         OtaResult::RequestResult(bytes)
     }
-
-    //TODO: refactor the last chunks detection logic
+    //FIXME: state switching (reboot, after failed hash verification)
     fn handle_chunk(&mut self, raw: OtaChunk<C>) -> OtaResult {
         tracing::trace!(tag = "ota", "got raw chunk, {} bytes", raw.data.len());
 
@@ -189,7 +188,6 @@ where
 
             tracing::info!("hashes match. written {} request {}", hash, request.hash);
 
-            // TODO: verify hash against request.crc before this
             if self.platform.set_boot_target().is_err() {
                 tracing::error!(tag = "ota", "failed to set boot target, dropping session");
                 self.state = OtaState::Idle;
