@@ -88,7 +88,7 @@ where
     }
 
     fn try_begin<'b>(&mut self, req: UpdateRequest, hdr_buf: &'b mut [u8]) -> Result<UpdateResponse<'b>, UpdateError> {
-        tracing::debug!(tag = "ota", "trying to begin ota update. hash {:?}", req.crc.0);
+        tracing::debug!(tag = "ota", "trying to begin ota update. hash {}", req.hash);
         if !matches!(self.state, OtaState::Idle) {
             tracing::info!(tag = "ota", "ota is busy, rejected update request");
             return Err(UpdateError::Busy);
@@ -159,7 +159,7 @@ where
 
         let OtaState::Progress { writer, request, last_activity } = &mut self.state else {
             tracing::warn!(tag = "ota", "got chunk without an active session, ignoring");
-            return OtaResult::Callback(Vec::new()); // TODO: NoSession bytes
+            return OtaResult::Nothing; // TODO: NoSession bytes
         };
 
         *last_activity = Instant::now();
@@ -170,20 +170,14 @@ where
             return OtaResult::Nothing;
         };
 
-        let Ok(write_result) = writer.write(&mut self.partition, &chunk) else {
+        //TODO: finish up assembler callbacks
+        let Ok(completed) = writer.write(&mut self.partition, &chunk) else {
             tracing::error!(tag = "ota", "failed to write chunk, dropping session");
             self.state = OtaState::Idle;
-            return OtaResult::Callback(Vec::new()); // TODO: Flash error bytes
+            return OtaResult::Nothing; // TODO: Flash error bytes
         };
 
-        let Some(end) = write_result else {
-            tracing::trace!(tag = "ota", "chunk accepted, nothing flushed to flash yet");
-            return OtaResult::Nothing;
-        };
-
-        tracing::debug!(tag = "ota", "chunk written, progress {}/{} bytes", end, size);
-
-        if end == size {
+        if completed {
             tracing::info!(tag = "ota", "all {} bytes received", size);
 
             let (matches, hash) = writer.verify(&mut self.partition, &request).unwrap();
